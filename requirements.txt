@@ -1,0 +1,6 @@
+python-fasthtml
+httpx
+python-jose[cryptography]
+pydantic
+python-dotenv
+sse-starlette
