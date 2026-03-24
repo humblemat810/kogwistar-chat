@@ -73,6 +73,32 @@ function logHtmxEvent(name, detail) {
     }
 }
 
+function focusEventsWindow() {
+    // The event panel is a scroll box; keep the newest debug state visible and
+    // make it easy to inspect with the keyboard if the user clicks into it.
+    const windowEl = document.getElementById('events-window');
+    if (!windowEl) {
+        return;
+    }
+
+    windowEl.focus({ preventScroll: true });
+    windowEl.scrollTop = 0;
+}
+
+let eventsWindowScrollQueued = false;
+
+function queueEventsWindowFocus() {
+    if (eventsWindowScrollQueued) {
+        return;
+    }
+
+    eventsWindowScrollQueued = true;
+    requestAnimationFrame(() => {
+        eventsWindowScrollQueued = false;
+        focusEventsWindow();
+    });
+}
+
 document.addEventListener('htmx:beforeRequest', (evt) => {
     // Helpful when debugging which fragment HTMX is about to fetch.
     const path = evt.detail?.pathInfo?.requestPath || evt.detail?.requestConfig?.path || 'unknown';
@@ -124,4 +150,24 @@ document.addEventListener('htmx:sseMessage', function (evt) {
             }
         }
     });
+
+    // Debug SSE rows land in the right-hand panel. Scroll the panel so the
+    // latest inserted content stays visible while you inspect the stream.
+    if (el && el.closest && el.closest('#events-window')) {
+        queueEventsWindowFocus();
+    }
+});
+
+document.addEventListener('htmx:afterSwap', (evt) => {
+    // HTMX out-of-band swaps do not always go through the same callback as the
+    // SSE extension, so we nudge the scroll box after any swap that touches it.
+    const target = evt.detail?.target || evt.target;
+    if (target && (target.id === 'events-window' || target.closest?.('#events-window'))) {
+        queueEventsWindowFocus();
+    }
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+    // If the page loads with an already-populated debug panel, keep it focused.
+    queueEventsWindowFocus();
 });

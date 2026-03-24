@@ -279,7 +279,7 @@ def RightPanel(current_run_id: str | None = None):
             id="events-window",
             cls="events-window",
             tabindex="0",
-            style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem; scroll-behavior: smooth;",
+            style="flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 0.5rem; scroll-behavior: smooth;",
         ),
         cls="panel right-panel shadow-premium",
     )

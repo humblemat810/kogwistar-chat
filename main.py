@@ -190,6 +190,36 @@ def _current_run_id(session) -> str:
     return ""
 
 
+def _load_debug_state(session, run_id: str) -> dict:
+    """Read the per-run debug UI state from the session."""
+
+    debug_runs = dict(session.get("debug_state") or {})
+    state = dict(debug_runs.get(run_id) or {})
+    state.setdefault("paused", False)
+    state.setdefault("resume_seq", 0)
+    state.setdefault("cleared", False)
+    return state
+
+
+def _save_debug_state(session, run_id: str, state: dict) -> None:
+    """Persist the per-run debug UI state back into the session."""
+
+    debug_runs = dict(session.get("debug_state") or {})
+    debug_runs[run_id] = dict(state)
+    session["debug_state"] = debug_runs
+
+
+def _debug_resume_seq(session, run_id: str) -> int:
+    """Pick the sequence number the debug SSE stream should resume from."""
+
+    debug_state = _load_debug_state(session, run_id)
+    resume_seq = int(debug_state.get("resume_seq") or 0)
+    if resume_seq:
+        return resume_seq
+    run_state = _load_run_state(session, run_id)
+    return int(run_state.get("last_seq") or 0)
+
+
 def _append_run_event(
     state: dict,
     event: dict,
@@ -337,6 +367,97 @@ def _render_debug_event_rows(run_id: str, events: list[dict[str, object]]) -> li
     return rows
 
 
+def _render_debug_window(
+    *,
+    run_id: str,
+    session,
+    events: list[dict[str, object]],
+    live: bool = False,
+    source: str = "session",
+) -> Div:
+    """Build the debug event panel body for the right sidebar."""
+
+    run_state = _load_run_state(session, run_id)
+    debug_state = _load_debug_state(session, run_id)
+    paused = bool(debug_state.get("paused"))
+    cleared = bool(debug_state.get("cleared"))
+    resume_seq = int(debug_state.get("resume_seq") or run_state.get("last_seq") or 0)
+    rows = [] if cleared and not live else _render_debug_event_rows(run_id, events)
+
+    if not rows:
+        rows = [Div("No events are loaded for this run.", cls="fallback-text", style="padding: 0.75rem;")]
+
+    toolbar = Div(
+        Button(
+            "Clear",
+            hx_post=f"/debug/run-events/{run_id}/clear",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            cls="btn-mini btn-outline",
+        ),
+        Button(
+            "Suspend SSE" if not paused else "SSE Suspended",
+            hx_post=f"/debug/run-events/{run_id}/suspend",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            cls="btn-mini btn-outline",
+        ),
+        Button(
+            "Watch Live" if not paused else f"Resume from #{resume_seq}",
+            hx_get=f"/debug/run-events?run_id={run_id}&mode=live&after_seq={resume_seq}",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            cls="btn-vibrant",
+        ),
+        Button(
+            "Load Events Once",
+            hx_get=f"/debug/run-events?run_id={run_id}&mode=once&after_seq={resume_seq if paused else 0}",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            cls="btn-mini btn-outline",
+        ),
+        style="display: flex; gap: 0.5rem; flex-wrap: wrap;",
+    )
+
+    status_bits = [f"source: {source}", f"seq: {int(run_state.get('last_seq') or 0)}"]
+    if cleared:
+        status_bits.insert(0, "cleared")
+    if paused:
+        status_bits.insert(0, f"paused at #{resume_seq}")
+    elif live:
+        status_bits.insert(0, "live")
+    elif run_state.get("terminal"):
+        status_bits.insert(0, f"terminal: {run_state.get('stage') or 'done'}")
+
+    return Div(
+        Div(
+            Div(f"Run {run_id}", cls="debug-status-line"),
+            Div(" | ".join(status_bits), cls="text-dim", style="margin-bottom: 0.5rem; font-size: 0.8rem;"),
+            Div(toolbar, cls="debug-toolbar"),
+            cls="debug-events-header",
+        ),
+        Div(
+            *(
+                [
+                    Div(
+                        "Live stream attached. New events will append below.",
+                        id=f"debug-live-{run_id}",
+                        hx_ext="sse",
+                        sse_connect=f"/debug/run-events/{run_id}/stream?after_seq={resume_seq}",
+                        sse_swap="message",
+                        cls="debug-live-shim",
+                    )
+                ]
+                if live and not paused
+                else []
+            ),
+            Div(*rows, cls="debug-event-list"),
+            cls="debug-events-shell",
+        ),
+        cls="debug-events-content",
+    )
+
+
 @rt("/cancel-run/{run_id}")
 async def post_cancel(run_id: str, session):
     """Cancel a running assistant job.
@@ -352,6 +473,52 @@ async def post_cancel(run_id: str, session):
     success = await graph_api.cancel_run(token, run_id)
     LOG.info("cancel_run run_id=%s success=%s", run_id, success)
     return ""
+
+
+@rt("/debug/run-events/{run_id}/clear")
+async def post_debug_run_events_clear(run_id: str, session):
+    """Clear the visible debug event list without destroying run history.
+
+    This is a UI-only reset. We keep the per-run history in session so the
+    user can load the same run again or resume from the last known sequence.
+    """
+
+    run_state = _load_run_state(session, run_id)
+    debug_state = _load_debug_state(session, run_id)
+    resume_seq = int(run_state.get("last_seq") or debug_state.get("resume_seq") or 0)
+
+    # Clearing the panel also pauses the live view, otherwise the next event
+    # would immediately repopulate the box before the user can inspect the gap.
+    debug_state["paused"] = True
+    debug_state["resume_seq"] = resume_seq
+    debug_state["cleared"] = True
+    _save_debug_state(session, run_id, debug_state)
+    _set_last_run_id(session, run_id)
+
+    return _render_debug_window(run_id=run_id, session=session, events=[], live=False, source="cleared")
+
+
+@rt("/debug/run-events/{run_id}/suspend")
+async def post_debug_run_events_suspend(run_id: str, session):
+    """Pause live debug streaming and remember the last visible sequence."""
+
+    run_state = _load_run_state(session, run_id)
+    debug_state = _load_debug_state(session, run_id)
+    resume_seq = int(run_state.get("last_seq") or debug_state.get("resume_seq") or 0)
+
+    debug_state["paused"] = True
+    debug_state["resume_seq"] = resume_seq
+    debug_state["cleared"] = False
+    _save_debug_state(session, run_id, debug_state)
+    _set_last_run_id(session, run_id)
+
+    return _render_debug_window(
+        run_id=run_id,
+        session=session,
+        events=list(run_state.get("events") or []),
+        live=False,
+        source="session",
+    )
 
 
 async def _ensure_conversation(session) -> str:
@@ -696,7 +863,7 @@ async def get_events(run_id: str, session):
 
 
 @rt("/debug/run-events")
-async def get_debug_run_events(run_id: str | None = None, mode: str = "once", session=None):
+async def get_debug_run_events(run_id: str | None = None, mode: str = "once", after_seq: int = 0, session=None):
     """Render a one-shot or live debug view for any saved run id.
 
     HTMX sends the selected mode from the button the user clicked. We keep this
@@ -709,30 +876,38 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", se
 
     run_id = str(run_id or _current_run_id(session)).strip()
     mode = str(mode or "once").strip().lower()
+    after_seq = int(after_seq or 0)
 
     if not run_id:
         return Div("Enter a run id to inspect its events.", cls="fallback-text")
 
     _set_last_run_id(session, run_id)
+    debug_state = _load_debug_state(session, run_id)
 
     if mode == "live":
+        # Mark the stream as active again and resume from the requested seq.
+        debug_state["paused"] = False
+        debug_state["resume_seq"] = (
+            after_seq
+            or int(debug_state.get("resume_seq") or 0)
+            or int(_load_run_state(session, run_id).get("last_seq") or 0)
+        )
+        debug_state["cleared"] = False
+        _save_debug_state(session, run_id, debug_state)
+
         # The debug shell stays in the right panel while SSE appends log rows.
-        return Div(
-            Div(f"Watching run {run_id}", cls="debug-status-line"),
-            Div(
-                "Live stream attached. New events will append below.",
-                id=f"debug-live-{run_id}",
-                hx_ext="sse",
-                sse_connect=f"/debug/run-events/{run_id}/stream",
-                sse_swap="message",
-                cls="debug-live-shim",
-            ),
-            cls="debug-live-shell",
+        return _render_debug_window(
+            run_id=run_id,
+            session=session,
+            events=list(_load_run_state(session, run_id).get("events") or []),
+            live=True,
+            source="live",
         )
 
     state = _load_run_state(session, run_id)
     events = list(state.get("events") or [])
     source = "session"
+    debug_state["cleared"] = False
 
     if not events:
         token = session.get("token")
@@ -740,7 +915,7 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", se
             return Div("Authentication expired.", cls="error-msg")
 
         try:
-            fetched_events = await graph_api.get_run_events(token, run_id, after_seq=0)
+            fetched_events = await graph_api.get_run_events(token, run_id, after_seq=after_seq)
         except Exception as exc:
             LOG.exception("debug load failed run_id=%s", run_id)
             return Div(f"Failed to load events for {run_id}: {exc}", cls="error-msg")
@@ -750,6 +925,18 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", se
             _ingest_run_event(state, evt)
         _save_run_state(session, state)
         events = list(state.get("events") or [])
+
+    debug_state["paused"] = False
+    debug_state["resume_seq"] = int(state.get("last_seq") or 0)
+    _save_debug_state(session, run_id, debug_state)
+
+    return _render_debug_window(
+        run_id=run_id,
+        session=session,
+        events=events,
+        live=False,
+        source=source,
+    )
 
     event_rows = _render_debug_event_rows(run_id, events)
     if not event_rows:
@@ -772,7 +959,7 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", se
 
 
 @rt("/debug/run-events/{run_id}/stream")
-async def get_debug_run_events_stream(run_id: str, session):
+async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0):
     """Stream a saved run into the debug panel without re-running it."""
 
     token = session.get("token")
@@ -784,10 +971,11 @@ async def get_debug_run_events_stream(run_id: str, session):
 
     state = _load_run_state(session, run_id)
     _set_last_run_id(session, run_id)
+    start_seq = int(after_seq or _debug_resume_seq(session, run_id) or 0)
 
     async def event_generator():
         try:
-            async for event in graph_api.stream_events(token, run_id, after_seq=int(state.get("last_seq") or 0)):
+            async for event in graph_api.stream_events(token, run_id, after_seq=start_seq):
                 seq, event_type, payload, label, detail = _ingest_run_event(state, event)
                 _save_run_state(session, state)
 
