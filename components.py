@@ -156,7 +156,14 @@ def render_assistant_container(
     )
 
 
-def render_event_log_item(*, run_id: str, seq: int, label: str, detail: str = ""):
+def render_event_log_item(
+    *,
+    run_id: str,
+    seq: int,
+    label: str,
+    detail: str = "",
+    swap_oob_target: str | None = "afterbegin:#events-window",
+):
     """Render one event row in the right-hand event log.
 
     `hx_swap_oob` means "out-of-band swap". HTMX can insert this fragment into
@@ -170,7 +177,7 @@ def render_event_log_item(*, run_id: str, seq: int, label: str, detail: str = ""
         Div(f"#{seq} {label}{detail_text}", cls="event-text"),
         id=f"evt-{run_id}-{seq}",
         cls="event-log-item shadow-premium",
-        hx_swap_oob="afterbegin:#events-window",
+        **({"hx_swap_oob": swap_oob_target} if swap_oob_target else {}),
     )
 
 
@@ -221,12 +228,59 @@ def ChatPanel(messages=None, current_conv_id=None):
     )
 
 
-def RightPanel():
-    """Render the event stream panel on the right side."""
+def RightPanel(current_run_id: str | None = None):
+    """Render the event stream panel on the right side.
+
+    The top form is a small debug tool. It lets us reuse the same backend run
+    event stream without sending a new chat message, which is useful when you
+    want to inspect a finished run or attach to an in-flight one.
+    """
+
+    run_id = str(current_run_id or "").strip()
 
     return Aside(
         H2("Agent Events", cls="sidebar-title"),
-        Div(id="events-window", cls="events-window", style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem;"),
+        P("Debug a run without sending a new message.", cls="text-dim", style="margin-top: -0.5rem; margin-bottom: 0.75rem; font-size: 0.85rem;"),
+        Form(
+            hx_get="/debug/run-events",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            cls="debug-run-form",
+            style="display: grid; gap: 0.5rem; margin-bottom: 0.75rem;",
+        )(
+            Label(
+                "Run ID",
+                Input(
+                    name="run_id",
+                    value=run_id,
+                    placeholder="run_...",
+                    cls="chat-input",
+                    style="width: 100%;",
+                ),
+                style="display: grid; gap: 0.25rem; font-size: 0.85rem;",
+            ),
+            Div(
+                Button("Load Events Once", type="submit", name="mode", value="once", cls="btn-vibrant"),
+                Button("Watch Live", type="submit", name="mode", value="live", cls="btn-mini btn-outline"),
+                style="display: flex; gap: 0.5rem; flex-wrap: wrap;",
+            ),
+        ),
+        Div(
+            "The event list below updates independently of the chat transcript.",
+            cls="text-dim",
+            style="margin-bottom: 0.5rem; font-size: 0.8rem;",
+        ),
+        Div(
+            Div(
+                "Pick a run and click a debug button.",
+                cls="fallback-text",
+                style="padding: 0.75rem;",
+            ),
+            id="events-window",
+            cls="events-window",
+            tabindex="0",
+            style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem; scroll-behavior: smooth;",
+        ),
         cls="panel right-panel shadow-premium",
     )
 

@@ -4,3 +4,4 @@ python-jose[cryptography]
 pydantic
 python-dotenv
 sse-starlette
+httpx-sse

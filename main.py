@@ -133,6 +133,7 @@ def _init_run_state(session, *, run_id: str, conv_id: str, user_text: str) -> No
         "run_id": run_id,
         "conversation_id": conv_id,
         "last_seq": 0,
+        "events": [],
         "text": "",
         "stage": "queued",
         "terminal": False,
@@ -164,6 +165,74 @@ def _save_run_state(session, state: dict) -> None:
     runs = dict(session.get("run_state") or {})
     runs[state["run_id"]] = dict(state)
     session["run_state"] = runs
+
+
+def _set_last_run_id(session, run_id: str | None) -> None:
+    """Remember the newest run id so the debug panel can prefill itself."""
+
+    run_id = str(run_id or "").strip()
+    if run_id:
+        session["last_run_id"] = run_id
+
+
+def _current_run_id(session) -> str:
+    """Return the most recent run id we know about for this browser session."""
+
+    last_run_id = str(session.get("last_run_id") or "").strip()
+    if last_run_id:
+        return last_run_id
+
+    runs = dict(session.get("run_state") or {})
+    if runs:
+        # `dict` keeps insertion order, so the newest tracked run is the last key.
+        return str(next(reversed(runs.keys())))
+
+    return ""
+
+
+def _append_run_event(
+    state: dict,
+    event: dict,
+    *,
+    seq: int,
+    event_type: str,
+    payload: dict,
+    label: str,
+    detail: str,
+) -> None:
+    """Store a normalized event record in the per-run session state."""
+
+    events = list(state.get("events") or [])
+    if any(int(item.get("seq") or 0) == int(seq) and str(item.get("event_type") or "") == event_type for item in events):
+        return
+    events.append(
+        {
+            "seq": seq,
+            "event_type": event_type,
+            "payload": dict(payload or {}),
+            "label": label,
+            "detail": detail,
+        }
+    )
+    state["events"] = events[-200:]
+
+
+def _event_seq(evt: dict, payload: dict, state: dict) -> int:
+    """Resolve the best sequence number available for an event."""
+
+    raw_seq = evt.get("seq")
+    if raw_seq is None:
+        raw_seq = evt.get("id")
+    if raw_seq is None:
+        raw_seq = payload.get("seq")
+    if raw_seq is None:
+        raw_seq = payload.get("step_seq")
+    if raw_seq is None:
+        raw_seq = int(state.get("last_seq") or 0) + 1
+    try:
+        return int(raw_seq or 0)
+    except (TypeError, ValueError):
+        return int(state.get("last_seq") or 0) + 1
 
 
 def _event_label(event_type: str, payload: dict) -> tuple[str, str]:
@@ -204,6 +273,68 @@ def _event_payload(evt: dict) -> dict:
         for key, value in evt.items()
         if key not in {"seq", "event_type", "type", "payload"}
     }
+
+
+def _ingest_run_event(state: dict, evt: dict) -> tuple[int, str, dict, str, str]:
+    """Normalize one backend event and fold it into the session state.
+
+    We use this in the normal chat stream and in the debug panel so both code
+    paths keep the same event history and the same terminal-state logic.
+    """
+
+    payload = _event_payload(evt)
+    seq = _event_seq(evt, payload, state)
+    event_type = str(evt.get("event_type") or evt.get("type") or "")
+    label, detail = _event_label(event_type, payload)
+
+    state["last_seq"] = max(int(state.get("last_seq") or 0), seq)
+    _append_run_event(state, evt, seq=seq, event_type=event_type, payload=payload, label=label, detail=detail)
+
+    if event_type == "run.stage":
+        state["stage"] = str(payload.get("stage") or evt.get("stage") or state.get("stage") or "running")
+    elif event_type == "reasoning.summary":
+        summary = str(payload.get("summary") or evt.get("summary") or "").strip()
+        if summary:
+            state["stage"] = summary
+    elif event_type == "output.delta":
+        delta = str(payload.get("delta") or evt.get("delta") or "")
+        if delta:
+            state["text"] = f"{state.get('text', '')}{delta}"
+    elif event_type == "run.completed":
+        state["terminal"] = True
+        state["stage"] = "completed"
+    elif event_type in {"run.failed", "run.cancelled"}:
+        state["terminal"] = True
+        state["stage"] = event_type.replace("run.", "")
+        err = payload.get("message") or evt.get("message") or state.get("error")
+        if err:
+            state["error"] = str(err)
+
+    return seq, event_type, payload, label, detail
+
+
+def _render_debug_event_rows(run_id: str, events: list[dict[str, object]]) -> list:
+    """Build a static event list for the debug panel.
+
+    These rows do not use `hx_swap_oob` because we want them to render as a
+    normal list when the user clicks "Load Events Once".
+    """
+
+    rows = []
+    for item in events:
+        seq = int(item.get("seq") or 0)
+        label = str(item.get("label") or item.get("event_type") or "Event")
+        detail = str(item.get("detail") or "")
+        rows.append(
+            render_event_log_item(
+                run_id=run_id,
+                seq=seq,
+                label=label,
+                detail=detail,
+                swap_oob_target=None,
+            )
+        )
+    return rows
 
 
 @rt("/cancel-run/{run_id}")
@@ -249,7 +380,7 @@ async def post_login_dev(session):
     try:
         # Requesting multiple namespaces as a list for better Pydantic validation
         token_data = await graph_api.get_dev_token(role="rw", ns=["conversation", "workflow", "docs"])
-        token = token_data.get("access_token")
+        token = token_data.get("token") or token_data.get("access_token")
         if not token:
             raise ValueError("No token returned from backend")
         
@@ -372,7 +503,7 @@ async def get_conv(conv_id: str, session, request: Request):
 
     res_sidebar = Sidebar(conversations=convs)
     res_chat = ChatPanel(messages=transcript, current_conv_id=conv_id)
-    res_right = RightPanel()
+    res_right = RightPanel(current_run_id=_current_run_id(session))
 
     if "hx-request" in request.headers:
         # HTMX requests only need the inner fragments, not the full page chrome.
@@ -422,6 +553,7 @@ async def post_msg(message: str, conv_id: str, session):
         return render_user_message(username=username, message=text), Div(f"Error: {exc}", cls="error-msg")
 
     _init_run_state(session, run_id=run_id, conv_id=conv_id, user_text=text)
+    _set_last_run_id(session, run_id)
     LOG.info("submit_turn success conv_id=%s run_id=%s", conv_id, run_id)
 
     if CHAT_STREAM_MODE == "sse":
@@ -461,33 +593,9 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
 
     oob_logs = []
     for evt in events:
-        seq = int(evt.get("seq") or last_seq)
-        state["last_seq"] = max(int(state.get("last_seq") or 0), seq)
-        event_type = str(evt.get("event_type") or evt.get("type") or "")
-        payload = _event_payload(evt)
-        label, detail = _event_label(event_type, payload)
+        seq, event_type, payload, label, detail = _ingest_run_event(state, evt)
         oob_logs.append(render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail))
         LOG.info("poll event run_id=%s seq=%s event=%s detail=%s", run_id, seq, label, detail)
-
-        if event_type == "run.stage":
-            state["stage"] = str(payload.get("stage") or evt.get("stage") or state.get("stage") or "running")
-        elif event_type == "reasoning.summary":
-            summary = str(payload.get("summary") or evt.get("summary") or "").strip()
-            if summary:
-                state["stage"] = summary
-        elif event_type == "output.delta":
-            delta = str(payload.get("delta") or evt.get("delta") or "")
-            if delta:
-                state["text"] = f"{state.get('text', '')}{delta}"
-        elif event_type == "run.completed":
-            state["terminal"] = True
-            state["stage"] = "completed"
-        elif event_type in {"run.failed", "run.cancelled"}:
-            state["terminal"] = True
-            state["stage"] = event_type.replace("run.", "")
-            err = payload.get("message") or evt.get("message") or state.get("error")
-            if err:
-                state["error"] = str(err)
 
     if not bool(state.get("terminal")):
         try:
@@ -500,6 +608,7 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
             LOG.exception("failed to fetch run status fallback run_id=%s", run_id)
 
     _save_run_state(session, state)
+    _set_last_run_id(session, run_id)
     assistant = render_assistant_container(
         run_id=run_id,
         text=str(state.get("text") or ""),
@@ -526,18 +635,13 @@ async def get_events(run_id: str, session):
         return EventSourceResponse(expired_gen())
 
     state = _load_run_state(session, run_id)
+    _set_last_run_id(session, run_id)
     LOG.info("sse connect run_id=%s last_seq=%s", run_id, state.get("last_seq"))
 
     async def event_generator():
         try:
             async for event in graph_api.stream_events(token, run_id, after_seq=int(state.get("last_seq") or 0)):
-                seq = int(event.get("seq") or state.get("last_seq") or 0)
-                if seq:
-                    state["last_seq"] = max(int(state.get("last_seq") or 0), seq)
-
-                event_type = str(event.get("event_type") or "message")
-                payload = _event_payload(event)
-                label, detail = _event_label(event_type, payload)
+                seq, event_type, payload, label, detail = _ingest_run_event(state, event)
                 LOG.info("sse event run_id=%s seq=%s event=%s detail=%s", run_id, seq, label, detail)
 
                 oob_log = render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail)
@@ -587,6 +691,119 @@ async def get_events(run_id: str, session):
         except Exception as e:
             LOG.exception("sse stream error run_id=%s", run_id)
             yield dict(data=f'<div class="error-msg">Stream Error: {str(e)}</div>', event="message")
+
+    return EventSourceResponse(event_generator())
+
+
+@rt("/debug/run-events")
+async def get_debug_run_events(run_id: str | None = None, mode: str = "once", session=None):
+    """Render a one-shot or live debug view for any saved run id.
+
+    HTMX sends the selected mode from the button the user clicked. We keep this
+    separate from the normal chat stream so you can inspect a run without
+    creating a new message turn.
+    """
+
+    if session is None:
+        return Div("Session unavailable.", cls="error-msg")
+
+    run_id = str(run_id or _current_run_id(session)).strip()
+    mode = str(mode or "once").strip().lower()
+
+    if not run_id:
+        return Div("Enter a run id to inspect its events.", cls="fallback-text")
+
+    _set_last_run_id(session, run_id)
+
+    if mode == "live":
+        # The debug shell stays in the right panel while SSE appends log rows.
+        return Div(
+            Div(f"Watching run {run_id}", cls="debug-status-line"),
+            Div(
+                "Live stream attached. New events will append below.",
+                id=f"debug-live-{run_id}",
+                hx_ext="sse",
+                sse_connect=f"/debug/run-events/{run_id}/stream",
+                sse_swap="message",
+                cls="debug-live-shim",
+            ),
+            cls="debug-live-shell",
+        )
+
+    state = _load_run_state(session, run_id)
+    events = list(state.get("events") or [])
+    source = "session"
+
+    if not events:
+        token = session.get("token")
+        if not token:
+            return Div("Authentication expired.", cls="error-msg")
+
+        try:
+            fetched_events = await graph_api.get_run_events(token, run_id, after_seq=0)
+        except Exception as exc:
+            LOG.exception("debug load failed run_id=%s", run_id)
+            return Div(f"Failed to load events for {run_id}: {exc}", cls="error-msg")
+
+        source = "backend"
+        for evt in fetched_events:
+            _ingest_run_event(state, evt)
+        _save_run_state(session, state)
+        events = list(state.get("events") or [])
+
+    event_rows = _render_debug_event_rows(run_id, events)
+    if not event_rows:
+        event_rows = [Div("No events were found for this run.", cls="fallback-text", style="padding: 0.75rem;")]
+
+    status_bits = [
+        f"source: {source}",
+        f"seq: {int(state.get('last_seq') or 0)}",
+    ]
+    if state.get("terminal"):
+        status_bits.insert(0, f"terminal: {state.get('stage') or 'done'}")
+    elif state.get("stage"):
+        status_bits.insert(0, f"stage: {state.get('stage')}")
+
+    return Div(
+        Div(f"Run {run_id}", cls="debug-status-line"),
+        Div(" · ".join(status_bits), cls="text-dim", style="margin-bottom: 0.5rem; font-size: 0.8rem;"),
+        Div(*event_rows, cls="debug-event-list", style="display: flex; flex-direction: column; gap: 0.5rem;"),
+    )
+
+
+@rt("/debug/run-events/{run_id}/stream")
+async def get_debug_run_events_stream(run_id: str, session):
+    """Stream a saved run into the debug panel without re-running it."""
+
+    token = session.get("token")
+    if not token:
+        async def expired_gen():
+            yield dict(data='<div class="error-msg">Authentication expired.</div>', event="message")
+
+        return EventSourceResponse(expired_gen())
+
+    state = _load_run_state(session, run_id)
+    _set_last_run_id(session, run_id)
+
+    async def event_generator():
+        try:
+            async for event in graph_api.stream_events(token, run_id, after_seq=int(state.get("last_seq") or 0)):
+                seq, event_type, payload, label, detail = _ingest_run_event(state, event)
+                _save_run_state(session, state)
+
+                oob_log = render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail)
+                banner = Div(f"Watching run {run_id} · {label} #{seq}", cls="debug-status-line")
+
+                # The banner keeps the SSE target alive while the rows append into
+                # the shared `#events-window` panel via HTMX out-of-band swaps.
+                if event_type in {"run.completed", "run.failed", "run.cancelled"}:
+                    yield dict(data=f"{banner}{str(oob_log)}", event="message")
+                    break
+
+                yield dict(data=f"{banner}{str(oob_log)}", event="message")
+        except Exception as exc:
+            LOG.exception("debug stream error run_id=%s", run_id)
+            yield dict(data=f'<div class="error-msg">Debug stream error: {str(exc)}</div>', event="message")
 
     return EventSourceResponse(event_generator())
 

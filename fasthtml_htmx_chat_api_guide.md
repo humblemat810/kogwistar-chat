@@ -30,7 +30,17 @@ Important caveat:
 
 - The current `/auth/dev-token` route does not validate a password.
 - It mints a JWT from the JSON body you send.
+- The request body must be valid JSON.
+- `ns` may be a single namespace, a comma-separated string, or a JSON list.
 - If the UI presents username/password fields, the password is only a UI affordance unless you add server-side verification.
+
+Role and namespace semantics:
+
+- `role=ro` is the minimum role for read endpoints.
+- `role=rw` is the minimum role for write endpoints.
+- A token with `role=rw` is acceptable for read endpoints because it exceeds the minimum.
+- The token must also carry the namespace required by the endpoint.
+- Dev tokens may contain multiple namespaces in the `ns` claim.
 
 ### Dev token request
 
@@ -41,7 +51,20 @@ Content-Type: application/json
 {
   "username": "alice",
   "role": "rw",
-  "ns": "conversation"
+  "ns": "docs,conversation,workflow,wisdom"
+}
+```
+
+Equivalent JSON-list form:
+
+```http
+POST /auth/dev-token
+Content-Type: application/json
+
+{
+  "username": "alice",
+  "role": "rw",
+  "ns": ["docs", "conversation", "workflow", "wisdom"]
 }
 ```
 
@@ -63,9 +86,45 @@ Authorization: Bearer <token>
 
 The token must carry the namespace and role needed by the endpoint:
 
-- Conversation read endpoints require `role=ro`
-- Conversation write endpoints require `role=rw`
+- Conversation read endpoints require at least `role=ro`
+- Conversation write endpoints require at least `role=rw`
 - The conversation namespace must be allowed
+
+Example token claims:
+
+```json
+{
+  "sub": "alice",
+  "role": "rw",
+  "ns": ["docs", "conversation", "workflow", "wisdom"]
+}
+```
+
+If the request body is empty or form-encoded instead of JSON, `/auth/dev-token` will fail before validation.
+
+### Minimal dev-login client example
+
+```js
+async function devLogin() {
+  const resp = await fetch("/auth/dev-token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "alice",
+      role: "rw",
+      ns: "docs,conversation,workflow,wisdom",
+    }),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`dev login failed: ${resp.status}`);
+  }
+
+  const data = await resp.json();
+  sessionStorage.setItem("jwt", data.token);
+  return data.token;
+}
+```
 
 ## Recommended UI Flow
 
@@ -113,6 +172,18 @@ Notes:
 - Results are sorted by `turn_count` descending.
 - This endpoint is intended for the left sidebar.
 
+Example client call:
+
+```js
+async function loadConversationList(token) {
+  const resp = await fetch("/api/conversations", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error(`list failed: ${resp.status}`);
+  return await resp.json();
+}
+```
+
 ### Create a conversation
 
 `POST /api/conversations`
@@ -150,6 +221,27 @@ Notes:
 - If the token-derived user id exists, the server uses it.
 - Otherwise the route falls back to `user_id` in the body.
 - The response also includes `start_node_id` from the create call.
+
+Example client call:
+
+```js
+async function createConversation(token, userId) {
+  const resp = await fetch("/api/conversations", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      user_id: userId,
+      conversation_id: null,
+      start_node_id: null,
+    }),
+  });
+  if (!resp.ok) throw new Error(`create failed: ${resp.status}`);
+  return await resp.json();
+}
+```
 
 ### Load a conversation summary
 
@@ -210,6 +302,18 @@ Response shape:
 
 Use this to render the center chat column.
 
+Example transcript fetch:
+
+```js
+async function loadTranscript(token, conversationId) {
+  const resp = await fetch(`/api/conversations/${conversationId}/turns`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error(`transcript failed: ${resp.status}`);
+  return await resp.json();
+}
+```
+
 ### Submit a user message
 
 `POST /api/conversations/{conversation_id}/turns:answer`
@@ -225,7 +329,7 @@ Request body:
 {
   "user_id": "alice",
   "text": "Summarize this project",
-  "workflow_id": "agentic_answering.v2" // or "debug.rag.v1" for debugging faster static workflow
+  "workflow_id": "agentic_answering.v2"
 }
 ```
 
@@ -250,6 +354,28 @@ Notes:
 - `text` must be non-empty.
 - If `user_id` is omitted, the server uses the conversation owner from the token-backed identity.
 - This endpoint creates the user turn first, then starts the run asynchronously.
+
+Example send-message flow:
+
+```js
+async function submitAnswer(token, conversationId, text, workflowId = "agentic_answering.v2") {
+  const resp = await fetch(`/api/conversations/${conversationId}/turns:answer`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      text,
+      workflow_id: workflowId,
+    }),
+  });
+  if (resp.status !== 202) {
+    throw new Error(`answer submit failed: ${resp.status}`);
+  }
+  return await resp.json();
+}
+```
 
 ## Run APIs
 
@@ -334,6 +460,35 @@ Resume behavior:
 
 - Persist the last event `id`
 - Reconnect with `after_seq=<last_id>`
+
+Example SSE hookup:
+
+```js
+function watchRunEvents(runId, afterSeq = 0) {
+  const es = new EventSource(`/api/runs/${runId}/events?after_seq=${afterSeq}`);
+
+  es.addEventListener("run.stage", (evt) => {
+    const data = JSON.parse(evt.data);
+    console.log("stage", data.stage);
+  });
+
+  es.addEventListener("reasoning.summary", (evt) => {
+    const data = JSON.parse(evt.data);
+    console.log("summary", data.summary);
+  });
+
+  es.addEventListener("output.delta", (evt) => {
+    const data = JSON.parse(evt.data);
+    console.log("delta", data.delta);
+  });
+
+  es.addEventListener("run.completed", () => es.close());
+  es.addEventListener("run.failed", () => es.close());
+  es.addEventListener("run.cancelled", () => es.close());
+
+  return es;
+}
+```
 
 ### Poll run events
 
@@ -470,6 +625,8 @@ The UI route can server-render the chat panel after fetching:
 - `GET /api/conversations/{conversation_id}`
 - `GET /api/conversations/{conversation_id}/turns`
 
+This works well when the UI wants to render the current transcript server-side before wiring SSE.
+
 ### New conversation button
 
 ```html
@@ -502,6 +659,8 @@ The FastHTML route should:
 1. Call `POST /api/conversations/{conversation_id}/turns:answer`
 2. Return a fragment that keeps the transcript visible
 3. Let the SSE listener stream the assistant response into the UI
+
+If the UI wants optimistic updates, it can render the user bubble locally and replace it only if the request fails.
 
 ## Example Event Handling
 
@@ -568,6 +727,15 @@ Practical UI rules:
 6. `POST /api/conversations/{conversation_id}/turns:answer`
 7. `GET /api/runs/{run_id}/events`
 8. `GET /api/runs/{run_id}` until terminal for lifecycle state only
+
+The common client pattern is:
+
+1. Login and store the JWT.
+2. Load the conversation list.
+3. Render the selected conversation transcript.
+4. Submit a message.
+5. Stream the run into the right-hand panel.
+6. Keep the transcript and the run telemetry separate.
 
 ## Implementation Notes For the Local Agent
 
