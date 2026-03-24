@@ -1,31 +1,45 @@
-// static/worker.js
+// Dedicated Web Worker for running small Python snippets in the browser.
+//
+// A worker keeps Pyodide isolated from the main UI thread, so the page stays
+// responsive while the Python code loads and executes.
+
 importScripts("https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js");
 
 let pyodide;
 
 async function initPyodide() {
+    // Load the runtime once and cache it for later requests.
     pyodide = await loadPyodide();
-    // Pre-load common packages if needed
+
+    // If you want extra libraries, preload them here.
+    // Example:
     // await pyodide.loadPackage(["numpy", "pandas"]);
+
     self.postMessage({ type: "ready" });
 }
 
 self.onmessage = async (event) => {
-    if (event.data.type === "init") {
+    const { type } = event.data;
+
+    if (type === "init") {
         await initPyodide();
-    } else if (event.data.type === "execute") {
+        return;
+    }
+
+    if (type === "execute") {
         const { code, id } = event.data;
+
         try {
-            // Redirect stdout to capture print statements
+            // Capture print() output by redirecting sys.stdout to a buffer.
             pyodide.runPython(`
 import sys
 import io
 sys.stdout = io.StringIO()
             `);
-            
+
             const result = await pyodide.runPythonAsync(code);
             const stdout = pyodide.runPython("sys.stdout.getvalue()");
-            
+
             self.postMessage({
                 type: "result",
                 id,
