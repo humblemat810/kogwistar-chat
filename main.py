@@ -16,10 +16,10 @@ HTML fragments instead of JSON.
 """
 
 import logging
-import inspect
 import os
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
+from typing import Any
 
 from dotenv import load_dotenv
 from fasthtml.common import *
@@ -41,6 +41,7 @@ from components import (
     render_user_message,
 )
 from graph_api import GraphAPI
+from sse_contracts import sse_route_contract, validate_sse_route_contracts
 
 load_dotenv()
 
@@ -69,6 +70,8 @@ def _trace_route(route_name: str, **fields) -> None:
 
     payload = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None and v != "")
     LOG.info("route=%s %s", route_name, payload)
+
+
 
 
 def _patch_reload_logging() -> None:
@@ -117,6 +120,8 @@ async def lifespan(app):
     LOG.info("SERVER_URL: %s", SERVER_URL)
     LOG.info("CHAT_APP_PORT: %s", CHAT_APP_PORT)
     LOG.info("CHAT_STREAM_MODE: %s", CHAT_STREAM_MODE)
+    # Fail fast if any SSE-only route lost its explicit SSE return contract.
+    validate_sse_route_contracts()
     for k, v in os.environ.items():
         if k.startswith(("HTTP", "GRAPHRAG", "CHAT")):
             LOG.info("ENV %s: %s", k, v)
@@ -1021,7 +1026,8 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
 
 
 @rt("/events/{run_id}")
-async def get_events(run_id: str, session):
+@sse_route_contract
+async def get_events(run_id: str, session) -> EventSourceResponse:
     """Stream backend events through SSE.
 
     This path is the lower-latency live mode. Instead of polling, the browser
@@ -1255,7 +1261,8 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", af
 
 
 @rt("/debug/run-events/{run_id}/stream")
-async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0):
+@sse_route_contract
+async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) -> EventSourceResponse:
     """Stream a saved run into the debug panel without re-running it."""
 
     token = session.get("token")

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import ast
 import asyncio
+import copy
+import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +16,7 @@ from sse_starlette.sse import EventSourceResponse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main
+import sse_contracts
 
 pytestmark = pytest.mark.ci
 
@@ -264,3 +269,97 @@ def test_debug_live_mode_backend_terminal_forces_history(monkeypatch):
     assert "stream-transport-shim" not in first_event["data"]
     assert "source: terminal" in first_event["data"]
     assert "completed" in first_event["data"]
+
+
+def test_sse_contract_runtime_guard_rejects_wrong_return_type():
+    @main.sse_route_contract
+    async def bad_stream() -> EventSourceResponse:
+        return {"not": "an EventSourceResponse"}  # type: ignore[return-value]
+
+    with pytest.raises(TypeError, match="must return EventSourceResponse"):
+        asyncio.run(bad_stream())
+
+
+def test_sse_contract_validator_rejects_missing_annotation():
+    async def _empty_stream():
+        if False:
+            yield "never"
+
+    async def bad_stream():
+        return EventSourceResponse(_empty_stream())
+
+    with pytest.raises(RuntimeError, match="annotated to return EventSourceResponse"):
+        sse_contracts.validate_sse_route_contracts([("bad_stream", bad_stream)])
+
+
+def test_mypy_checks_real_sse_routes_from_main():
+    main_path = Path(__file__).resolve().parent.parent / "main.py"
+    source = main_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(main_path))
+    selected = []
+    referenced_names: set[str] = set()
+    builtin_names = set(dir(__import__("builtins")))
+
+    for node in tree.body:
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if not any(
+            isinstance(dec, ast.Name) and dec.id == "sse_route_contract"
+            for dec in node.decorator_list
+        ):
+            continue
+        selected.append(copy.deepcopy(node))
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                referenced_names.add(sub.id)
+
+    assert selected, "expected at least one SSE route decorated with sse_route_contract"
+
+    helper_names = sorted(
+        name
+        for name in referenced_names
+        if name not in builtin_names
+        and name not in {"EventSourceResponse", "Any", "bool", "dict", "list", "str", "int", "float", "set", "tuple", "None"}
+    )
+
+    probe = Path.cwd() / "_mypy_sse_contract_probe.py"
+    probe_source = "\n".join(
+        [
+            "from __future__ import annotations",
+            "",
+            "from typing import Any",
+            "from sse_starlette.sse import EventSourceResponse",
+            "",
+            *[f"{name}: Any" for name in helper_names],
+            "",
+            *[
+                ast.unparse(
+                    ast.fix_missing_locations(
+                        ast.AsyncFunctionDef(
+                            name=node.name,
+                            args=node.args,
+                            body=node.body,
+                            decorator_list=[],
+                            returns=node.returns,
+                            type_comment=node.type_comment,
+                        )
+                    )
+                )
+                for node in selected
+            ],
+            "",
+        ]
+    )
+    probe.write_text(probe_source, encoding="utf-8")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "mypy", str(probe)],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        with suppress(FileNotFoundError):
+            probe.unlink()
+    if proc.returncode != 0 and "No module named mypy" in (proc.stderr or proc.stdout):
+        pytest.skip("mypy is not installed in this environment")
+    assert proc.returncode == 0, proc.stdout + proc.stderr

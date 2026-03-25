@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "htmxchat"
+version = "0.1.0"
+description = "FastHTML + HTMX + SSE chat demo"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-fasthtml",
+    "httpx",
+    "python-jose[cryptography]",
+    "pydantic",
+    "python-dotenv",
+    "sse-starlette",
+    "httpx-sse",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "mypy",
+]
+
+[tool.setuptools]
+py-modules = ["main", "graph_api", "components", "sse_contracts"]
+
+[tool.pytest.ini_options]
+markers = [
+    "ci: automated regression tests suitable for continuous integration",
+    "manual: smoke tests or opt-in checks that are run by hand",
+]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["main.py", "graph_api.py", "components.py", "tests"]
+pretty = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
