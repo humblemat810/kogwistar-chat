@@ -16,6 +16,7 @@ HTML fragments instead of JSON.
 """
 
 import logging
+import inspect
 import os
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
@@ -29,9 +30,13 @@ from components import (
     RightPanel,
     Sidebar,
     ThreePanelLayout,
+    render_assistant_body,
     render_assistant_container,
     render_assistant_text,
     render_event_log_item,
+    render_right_panel_controls,
+    render_right_panel_viewport,
+    render_stream_shim,
     render_thinking_state,
     render_user_message,
 )
@@ -57,6 +62,45 @@ logging.basicConfig(
     ]
 )
 LOG = logging.getLogger("htmx.main")
+
+
+def _trace_route(route_name: str, **fields) -> None:
+    """Emit a compact route-entry trace with the most useful state."""
+
+    payload = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None and v != "")
+    LOG.info("route=%s %s", route_name, payload)
+
+
+def _patch_reload_logging() -> None:
+    """Make reload output show the actual file paths that triggered it.
+
+    Uvicorn's watchfiles supervisor only prints a generic "change detected"
+    line by default. For noisy editor saves, that is not enough to understand
+    what is bouncing the server, so we wrap the watcher and log the paths.
+    """
+
+    try:
+        import uvicorn.supervisors.watchfilesreload as watchfilesreload
+    except Exception:
+        return
+
+    original = watchfilesreload.WatchFilesReload.should_restart
+    if getattr(original, "_htmxchat_patched", False):
+        return
+
+    def should_restart(self):
+        changed_paths = original(self)
+        if changed_paths:
+            path_list = ", ".join(sorted(str(path) for path in changed_paths))
+            LOG.info("reload triggered by: %s", path_list)
+        return changed_paths
+
+    should_restart._htmxchat_patched = True  # type: ignore[attr-defined]
+    watchfilesreload.WatchFilesReload.should_restart = should_restart
+    logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
+
+
+_patch_reload_logging()
 
 # These headers are injected into every page.
 hdrs = (
@@ -84,7 +128,8 @@ app, rt = fast_app(
     debug=True, 
     hdrs=hdrs, 
     secret_key=os.getenv("SECRET_KEY", "default-secret-key"),
-    lifespan=lifespan
+    lifespan=lifespan,
+    pico=True,
 )
 
 graph_api = GraphAPI()
@@ -159,12 +204,50 @@ def _load_run_state(session, run_id: str) -> dict:
     return state
 
 
+def _has_run_state(session, run_id: str) -> bool:
+    """Tell whether this browser session already tracks the run."""
+
+    runs = dict(session.get("run_state") or {})
+    return bool(run_id and run_id in runs)
+
+
 def _save_run_state(session, state: dict) -> None:
     """Persist an updated run state back into the session."""
 
     runs = dict(session.get("run_state") or {})
     runs[state["run_id"]] = dict(state)
     session["run_state"] = runs
+
+
+async def _hydrate_run_state_once(session, token: str, run_id: str) -> dict:
+    """Fetch one backend snapshot for an untracked historical run.
+
+    A run from an older conversation may not exist in the current browser
+    session yet. Without one backend check, we would treat it as `queued` and
+    incorrectly open live SSE even though it has already finished.
+    """
+
+    state = _load_run_state(session, run_id)
+    if _has_run_state(session, run_id):
+        return state
+
+    try:
+        events = await graph_api.get_run_events(token, run_id, after_seq=0)
+        for evt in events:
+            _ingest_run_event(state, evt)
+    except Exception:
+        LOG.exception("failed to hydrate run events run_id=%s", run_id)
+
+    try:
+        run = await graph_api.get_run(token, run_id)
+        if bool(run.get("terminal")):
+            state["terminal"] = True
+        state["stage"] = str(run.get("status") or state.get("stage") or "queued")
+    except Exception:
+        LOG.exception("failed to hydrate run status run_id=%s", run_id)
+
+    _save_run_state(session, state)
+    return state
 
 
 def _set_last_run_id(session, run_id: str | None) -> None:
@@ -188,6 +271,32 @@ def _current_run_id(session) -> str:
         return str(next(reversed(runs.keys())))
 
     return ""
+
+
+def _load_panel_state(session) -> dict:
+    """Read the global right-panel state for this browser session."""
+
+    state = dict(session.get("debug_panel") or {})
+    state.setdefault("run_id", _current_run_id(session))
+    state.setdefault("mode", "history")
+    state.setdefault("paused", False)
+    return state
+
+
+def _save_panel_state(session, state: dict) -> None:
+    """Persist the global right-panel state back into the session."""
+
+    session["debug_panel"] = dict(state)
+
+
+def _sync_panel_to_run(session, run_id: str, *, auto_live: bool = False) -> None:
+    """Point the right panel at the newest run without destroying history mode."""
+
+    panel_state = _load_panel_state(session)
+    panel_state["run_id"] = run_id
+    if auto_live and str(panel_state.get("mode") or "history") == "live" and not bool(panel_state.get("paused")):
+        panel_state["mode"] = "live"
+    _save_panel_state(session, panel_state)
 
 
 def _load_debug_state(session, run_id: str) -> dict:
@@ -218,6 +327,14 @@ def _debug_resume_seq(session, run_id: str) -> int:
         return resume_seq
     run_state = _load_run_state(session, run_id)
     return int(run_state.get("last_seq") or 0)
+
+
+def _panel_resume_seq(session, run_id: str) -> int:
+    """Expose the resume sequence for the run currently shown on the right."""
+
+    if not run_id:
+        return 0
+    return int(_debug_resume_seq(session, run_id) or 0)
 
 
 def _append_run_event(
@@ -374,87 +491,86 @@ def _render_debug_window(
     events: list[dict[str, object]],
     live: bool = False,
     source: str = "session",
+    swap_oob_target: str | None = None,
 ) -> Div:
-    """Build the debug event panel body for the right sidebar."""
+    """Build the viewport content for the right sidebar.
+
+    The outer control surface lives in `RightPanel(...)`. This function only
+    renders the status + event log area so the routes can swap the viewport
+    without duplicating a second toolbar inside it.
+    """
 
     run_state = _load_run_state(session, run_id)
     debug_state = _load_debug_state(session, run_id)
+    panel_state = _load_panel_state(session)
     paused = bool(debug_state.get("paused"))
+    run_terminal = bool(run_state.get("terminal"))
+    effective_live = bool(live and not paused and not run_terminal)
     cleared = bool(debug_state.get("cleared"))
     resume_seq = int(debug_state.get("resume_seq") or run_state.get("last_seq") or 0)
     rows = [] if cleared and not live else _render_debug_event_rows(run_id, events)
-
-    if not rows:
-        rows = [Div("No events are loaded for this run.", cls="fallback-text", style="padding: 0.75rem;")]
-
-    toolbar = Div(
-        Button(
-            "Clear",
-            hx_post=f"/debug/run-events/{run_id}/clear",
-            hx_target="#events-window",
-            hx_swap="innerHTML",
-            cls="btn-mini btn-outline",
-        ),
-        Button(
-            "Suspend SSE" if not paused else "SSE Suspended",
-            hx_post=f"/debug/run-events/{run_id}/suspend",
-            hx_target="#events-window",
-            hx_swap="innerHTML",
-            cls="btn-mini btn-outline",
-        ),
-        Button(
-            "Watch Live" if not paused else f"Resume from #{resume_seq}",
-            hx_get=f"/debug/run-events?run_id={run_id}&mode=live&after_seq={resume_seq}",
-            hx_target="#events-window",
-            hx_swap="innerHTML",
-            cls="btn-vibrant",
-        ),
-        Button(
-            "Load Events Once",
-            hx_get=f"/debug/run-events?run_id={run_id}&mode=once&after_seq={resume_seq if paused else 0}",
-            hx_target="#events-window",
-            hx_swap="innerHTML",
-            cls="btn-mini btn-outline",
-        ),
-        style="display: flex; gap: 0.5rem; flex-wrap: wrap;",
-    )
+    display_mode = "live" if effective_live else "history"
+    if run_terminal:
+        panel_state["mode"] = "history"
 
     status_bits = [f"source: {source}", f"seq: {int(run_state.get('last_seq') or 0)}"]
     if cleared:
         status_bits.insert(0, "cleared")
     if paused:
         status_bits.insert(0, f"paused at #{resume_seq}")
-    elif live:
+    elif effective_live:
         status_bits.insert(0, "live")
+    elif live and run_terminal:
+        status_bits.insert(0, f"live unavailable: terminal")
     elif run_state.get("terminal"):
         status_bits.insert(0, f"terminal: {run_state.get('stage') or 'done'}")
+    if run_state.get("stage") and not run_state.get("terminal") and not live:
+        status_bits.insert(0, f"stage: {run_state.get('stage')}")
 
-    return Div(
-        Div(
-            Div(f"Run {run_id}", cls="debug-status-line"),
-            Div(" | ".join(status_bits), cls="text-dim", style="margin-bottom: 0.5rem; font-size: 0.8rem;"),
-            Div(toolbar, cls="debug-toolbar"),
-            cls="debug-events-header",
-        ),
-        Div(
-            *(
-                [
-                    Div(
-                        "Live stream attached. New events will append below.",
-                        id=f"debug-live-{run_id}",
-                        hx_ext="sse",
-                        sse_connect=f"/debug/run-events/{run_id}/stream?after_seq={resume_seq}",
-                        sse_swap="message",
-                        cls="debug-live-shim",
-                    )
-                ]
-                if live and not paused
-                else []
-            ),
-            Div(*rows, cls="debug-event-list"),
-            cls="debug-events-shell",
-        ),
-        cls="debug-events-content",
+    return render_right_panel_viewport(
+        run_id=run_id,
+        mode=display_mode,
+        paused=paused,
+        source=source,
+        rows=rows,
+        status_bits=status_bits,
+        live_url=(f"/debug/run-events/{run_id}/stream?after_seq={resume_seq}" if effective_live else None),
+        swap_oob_target=swap_oob_target,
+    )
+
+
+def _render_controls_oob(session, run_id: str | None = None) -> Div:
+    """Render the right-panel controls as an out-of-band replacement."""
+
+    panel_state = _load_panel_state(session)
+    resolved_run_id = str(run_id or panel_state.get("run_id") or _current_run_id(session) or "").strip()
+    debug_state = _load_debug_state(session, resolved_run_id) if resolved_run_id else {"paused": False, "resume_seq": 0}
+    run_state = _load_run_state(session, resolved_run_id) if resolved_run_id else {"terminal": False}
+    mode = str(panel_state.get("mode") or "history")
+    if bool(run_state.get("terminal")):
+        mode = "history"
+    return render_right_panel_controls(
+        current_run_id=resolved_run_id,
+        mode=mode,
+        paused=bool(panel_state.get("paused") or debug_state.get("paused")),
+        resume_seq=int(debug_state.get("resume_seq") or _panel_resume_seq(session, resolved_run_id)),
+        terminal=bool(run_state.get("terminal")),
+        swap_oob_target="outerHTML:#debug-panel-controls",
+    )
+
+
+def _render_events_window_oob(session, run_id: str, *, live: bool, source: str = "session") -> Div:
+    """Render the right-panel viewport as an out-of-band replacement."""
+
+    state = _load_run_state(session, run_id)
+    events = [] if bool(_load_debug_state(session, run_id).get("cleared")) and not live else list(state.get("events") or [])
+    return _render_debug_window(
+        run_id=run_id,
+        session=session,
+        events=events,
+        live=live,
+        source=source,
+        swap_oob_target="innerHTML:#events-window",
     )
 
 
@@ -475,50 +591,89 @@ async def post_cancel(run_id: str, session):
     return ""
 
 
-@rt("/debug/run-events/{run_id}/clear")
-async def post_debug_run_events_clear(run_id: str, session):
-    """Clear the visible debug event list without destroying run history.
-
-    This is a UI-only reset. We keep the per-run history in session so the
-    user can load the same run again or resume from the last known sequence.
-    """
+def _handle_debug_clear(run_id: str, session):
+    """Clear the visible debug viewport without deleting stored run history."""
 
     run_state = _load_run_state(session, run_id)
     debug_state = _load_debug_state(session, run_id)
+    panel_state = _load_panel_state(session)
     resume_seq = int(run_state.get("last_seq") or debug_state.get("resume_seq") or 0)
 
-    # Clearing the panel also pauses the live view, otherwise the next event
-    # would immediately repopulate the box before the user can inspect the gap.
     debug_state["paused"] = True
     debug_state["resume_seq"] = resume_seq
     debug_state["cleared"] = True
     _save_debug_state(session, run_id, debug_state)
     _set_last_run_id(session, run_id)
+    panel_state["run_id"] = run_id
+    panel_state["paused"] = True
+    _save_panel_state(session, panel_state)
 
-    return _render_debug_window(run_id=run_id, session=session, events=[], live=False, source="cleared")
+    return (
+        _render_debug_window(run_id=run_id, session=session, events=[], live=False, source="cleared"),
+        _render_controls_oob(session, run_id),
+    )
 
 
-@rt("/debug/run-events/{run_id}/suspend")
-async def post_debug_run_events_suspend(run_id: str, session):
-    """Pause live debug streaming and remember the last visible sequence."""
+def _handle_debug_toggle_suspend(run_id: str, session):
+    """Suspend or resume live debug SSE for the selected run."""
 
     run_state = _load_run_state(session, run_id)
     debug_state = _load_debug_state(session, run_id)
+    panel_state = _load_panel_state(session)
     resume_seq = int(run_state.get("last_seq") or debug_state.get("resume_seq") or 0)
 
-    debug_state["paused"] = True
+    paused = not bool(debug_state.get("paused"))
+    debug_state["paused"] = paused
     debug_state["resume_seq"] = resume_seq
     debug_state["cleared"] = False
     _save_debug_state(session, run_id, debug_state)
     _set_last_run_id(session, run_id)
+    panel_state["run_id"] = run_id
+    panel_state["mode"] = "live"
+    panel_state["paused"] = paused
+    _save_panel_state(session, panel_state)
 
     return _render_debug_window(
         run_id=run_id,
         session=session,
         events=list(run_state.get("events") or []),
-        live=False,
+        live=not paused,
         source="session",
-    )
+    ), _render_controls_oob(session, run_id)
+
+
+@rt("/debug/run-events/clear")
+async def post_debug_run_events_clear(run_id: str = "", session=None):
+    """Clear the visible debug event list using the single control form."""
+
+    run_id = str(run_id or _load_panel_state(session).get("run_id") or _current_run_id(session) or "").strip()
+    if not run_id:
+        return Div("Enter a run id to clear its viewport.", cls="fallback-text")
+    return _handle_debug_clear(run_id, session)
+
+
+@rt("/debug/run-events/{run_id}/clear")
+async def post_debug_run_events_clear_path(run_id: str, session):
+    """Backward-compatible clear route for older HTMX controls."""
+
+    return _handle_debug_clear(run_id, session)
+
+
+@rt("/debug/run-events/toggle-suspend")
+async def post_debug_run_events_toggle_suspend(run_id: str = "", session=None):
+    """Suspend or resume the live SSE viewport using the control form."""
+
+    run_id = str(run_id or _load_panel_state(session).get("run_id") or _current_run_id(session) or "").strip()
+    if not run_id:
+        return Div("Enter a run id before toggling live SSE.", cls="fallback-text")
+    return _handle_debug_toggle_suspend(run_id, session)
+
+
+@rt("/debug/run-events/{run_id}/suspend")
+async def post_debug_run_events_suspend_path(run_id: str, session):
+    """Backward-compatible suspend route for older HTMX controls."""
+
+    return _handle_debug_toggle_suspend(run_id, session)
 
 
 async def _ensure_conversation(session) -> str:
@@ -644,6 +799,13 @@ async def get_conv(conv_id: str, session, request: Request):
     if "token" not in session:
         return Redirect("/login")
 
+    _trace_route(
+        "get_conv",
+        conv_id=conv_id,
+        panel_mode=str(_load_panel_state(session).get("mode") or "history"),
+        panel_run_id=str(_load_panel_state(session).get("run_id") or _current_run_id(session) or ""),
+    )
+
     token = session["token"]
     user_id = session.get("user_id", "")
 
@@ -668,9 +830,23 @@ async def get_conv(conv_id: str, session, request: Request):
         transcript = []
         LOG.exception("failed to load transcript conv_id=%s", conv_id)
 
+    panel_state = _load_panel_state(session)
+    panel_run_id = str(panel_state.get("run_id") or _current_run_id(session) or "").strip()
+    if panel_run_id and token and not _has_run_state(session, panel_run_id):
+        await _hydrate_run_state_once(session, token, panel_run_id)
+    if panel_run_id and bool(_load_run_state(session, panel_run_id).get("terminal")):
+        panel_state["mode"] = "history"
+        panel_state["paused"] = False
+        _save_panel_state(session, panel_state)
     res_sidebar = Sidebar(conversations=convs)
     res_chat = ChatPanel(messages=transcript, current_conv_id=conv_id)
-    res_right = RightPanel(current_run_id=_current_run_id(session))
+    res_right = RightPanel(
+        current_run_id=panel_run_id,
+        mode=str(panel_state.get("mode") or "history"),
+        paused=bool(panel_state.get("paused")),
+        resume_seq=_panel_resume_seq(session, panel_run_id),
+        terminal=bool(_load_run_state(session, panel_run_id).get("terminal")) if panel_run_id else False,
+    )
 
     if "hx-request" in request.headers:
         # HTMX requests only need the inner fragments, not the full page chrome.
@@ -707,6 +883,14 @@ async def post_msg(message: str, conv_id: str, session):
         LOG.warning("Unauthorized /send-message attempt")
         return Redirect("/login")
 
+    _trace_route(
+        "post_msg",
+        conv_id=conv_id,
+        message_len=len(text),
+        panel_mode=str(_load_panel_state(session).get("mode") or "history"),
+        last_run_id=str(session.get("last_run_id") or ""),
+    )
+
     username = session.get("username", "You")
     user_id = session.get("user_id", "user")
     session["conversation_id"] = conv_id
@@ -721,17 +905,35 @@ async def post_msg(message: str, conv_id: str, session):
 
     _init_run_state(session, run_id=run_id, conv_id=conv_id, user_text=text)
     _set_last_run_id(session, run_id)
+    _sync_panel_to_run(session, run_id, auto_live=True)
     LOG.info("submit_turn success conv_id=%s run_id=%s", conv_id, run_id)
 
+    panel_state = _load_panel_state(session)
+    is_live_panel = str(panel_state.get("mode") or "history") == "live" and not bool(panel_state.get("paused"))
+
     if CHAT_STREAM_MODE == "sse":
+        sse_url = f"/events/{run_id}"
+        LOG.info("assistant transport run_id=%s mode=sse sse_url=%s", run_id, sse_url)
         assistant = render_assistant_container(run_id=run_id, sse_url=f"/events/{run_id}")
     else:
+        poll_url = f"/runs/{run_id}/poll?after_seq=0"
+        LOG.info("assistant transport run_id=%s mode=poll poll_url=%s", run_id, poll_url)
         assistant = render_assistant_container(
             run_id=run_id,
-            poll_url=f"/runs/{run_id}/poll?after_seq=0",
+            poll_url=poll_url,
             poll_interval_ms=POLL_INTERVAL_MS,
         )
-    return (render_user_message(username=username, message=text), assistant)
+
+    panel_updates: list = [_render_controls_oob(session, run_id)]
+    if is_live_panel:
+        debug_state = _load_debug_state(session, run_id)
+        debug_state["paused"] = False
+        debug_state["cleared"] = False
+        debug_state["resume_seq"] = 0
+        _save_debug_state(session, run_id, debug_state)
+        panel_updates.append(_render_events_window_oob(session, run_id, live=True, source="live"))
+
+    return (render_user_message(username=username, message=text), assistant, *panel_updates)
 
 
 @rt("/runs/{run_id}/poll")
@@ -744,9 +946,30 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
 
     token = session.get("token")
     if not token:
-        return render_assistant_container(run_id=run_id, text="Authentication expired.", error="Please log in again.")
+        return render_assistant_body(run_id=run_id, error="Please log in again.", terminal=True)
 
     state = _load_run_state(session, run_id)
+    _trace_route(
+        "get_run_poll",
+        run_id=run_id,
+        after_seq=after_seq,
+        terminal=bool(state.get("terminal")),
+        stage=str(state.get("stage") or ""),
+        last_seq=int(state.get("last_seq") or 0),
+    )
+    if state.get("terminal"):
+        _set_last_run_id(session, run_id)
+        LOG.info("assistant transport terminal run_id=%s mode=poll stage=%s", run_id, state.get("stage"))
+        return render_assistant_body(
+            run_id=run_id,
+            text=str(state.get("text") or ""),
+            stage=str(state.get("stage") or "queued"),
+            error=(str(state.get("error")) if state.get("error") else None),
+            poll_url=None,
+            poll_interval_ms=POLL_INTERVAL_MS,
+            terminal=True,
+        )
+
     last_seq = max(int(after_seq or 0), int(state.get("last_seq") or 0))
 
     try:
@@ -756,7 +979,13 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
         state["terminal"] = True
         _save_run_state(session, state)
         LOG.exception("poll failed run_id=%s after_seq=%s", run_id, last_seq)
-        return render_assistant_container(run_id=run_id, text=state.get("text") or "", stage=state.get("stage"), error=state["error"])
+        return render_assistant_body(
+            run_id=run_id,
+            text=state.get("text") or "",
+            stage=state.get("stage"),
+            error=state["error"],
+            terminal=True,
+        )
 
     oob_logs = []
     for evt in events:
@@ -776,13 +1005,17 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
 
     _save_run_state(session, state)
     _set_last_run_id(session, run_id)
-    assistant = render_assistant_container(
+    if state.get("terminal"):
+        LOG.info("assistant transport terminal run_id=%s mode=poll stage=%s", run_id, state.get("stage"))
+
+    assistant = render_assistant_body(
         run_id=run_id,
         text=str(state.get("text") or ""),
         stage=str(state.get("stage") or "queued"),
         error=(str(state.get("error")) if state.get("error") else None),
         poll_url=(None if state.get("terminal") else f"/runs/{run_id}/poll?after_seq={int(state.get('last_seq') or 0)}"),
         poll_interval_ms=POLL_INTERVAL_MS,
+        terminal=bool(state.get("terminal")),
     )
     return (assistant, *oob_logs)
 
@@ -802,62 +1035,79 @@ async def get_events(run_id: str, session):
         return EventSourceResponse(expired_gen())
 
     state = _load_run_state(session, run_id)
+    _trace_route(
+        "get_events",
+        run_id=run_id,
+        terminal=bool(state.get("terminal")),
+        last_seq=int(state.get("last_seq") or 0),
+    )
     _set_last_run_id(session, run_id)
     LOG.info("sse connect run_id=%s last_seq=%s", run_id, state.get("last_seq"))
+
+    if state.get("terminal"):
+        async def terminal_gen():
+            body = render_assistant_body(
+                run_id=run_id,
+                text=str(state.get("text") or ""),
+                stage=str(state.get("stage") or "completed"),
+                error=(str(state.get("error")) if state.get("error") else None),
+                terminal=True,
+                swap_oob_target=f"outerHTML:#run-{run_id}",
+            )
+            shim = render_stream_shim(
+                run_id=run_id,
+                active=False,
+                swap_oob_target=f"outerHTML:#run-stream-{run_id}",
+            )
+            yield dict(data=f"{str(body)}{str(shim)}", event="message")
+
+        return EventSourceResponse(terminal_gen())
 
     async def event_generator():
         try:
             async for event in graph_api.stream_events(token, run_id, after_seq=int(state.get("last_seq") or 0)):
                 seq, event_type, payload, label, detail = _ingest_run_event(state, event)
                 LOG.info("sse event run_id=%s seq=%s event=%s detail=%s", run_id, seq, label, detail)
-
                 oob_log = render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail)
+                _save_run_state(session, state)
 
-                if event_type == "run.stage":
-                    state["stage"] = str(payload.get("stage") or state.get("stage") or "running")
-                    _save_run_state(session, state)
-                    html = str(render_thinking_state(run_id=run_id, stage=state["stage"]))
-                    yield dict(data=f"{html}{str(oob_log)}", event="message")
+                body = render_assistant_body(
+                    run_id=run_id,
+                    text=str(state.get("text") or ""),
+                    stage=str(state.get("stage") or "queued"),
+                    error=(str(state.get("error")) if state.get("error") else None),
+                    sse_url=(None if state.get("terminal") else f"/events/{run_id}"),
+                    terminal=bool(state.get("terminal")),
+                    swap_oob_target=f"outerHTML:#run-{run_id}",
+                )
 
-                elif event_type == "reasoning.summary":
-                    summary = str(payload.get("summary") or "").strip()
-                    if summary:
-                        state["stage"] = summary
-                        _save_run_state(session, state)
-                        html = str(render_thinking_state(run_id=run_id, stage=summary))
-                        yield dict(data=f"{html}{str(oob_log)}", event="message")
-
-                elif event_type == "output.delta":
-                    delta = str(payload.get("delta") or "")
-                    if delta:
-                        state["text"] = f"{state.get('text', '')}{delta}"
-                        _save_run_state(session, state)
-                        html_output = str(render_assistant_text(state["text"]))
-                        yield dict(data=f"{html_output}{str(oob_log)}", event="message")
-
-                elif event_type == "run.completed":
-                    state["terminal"] = True
-                    state["stage"] = "completed"
-                    _save_run_state(session, state)
-                    html_output = str(render_assistant_text(state.get("text") or "(No output)"))
-                    yield dict(data=f"{html_output}{str(oob_log)}", event="message")
+                if event_type in {"run.completed", "run.failed", "run.cancelled"}:
+                    LOG.info("assistant transport terminal run_id=%s mode=sse event=%s", run_id, event_type)
+                    shim = render_stream_shim(
+                        run_id=run_id,
+                        active=False,
+                        swap_oob_target=f"outerHTML:#run-stream-{run_id}",
+                    )
+                    yield dict(data=f"{str(body)}{str(oob_log)}{str(shim)}", event="message")
                     break
 
-                elif event_type in {"run.failed", "run.cancelled"}:
-                    state["terminal"] = True
-                    state["stage"] = event_type.replace("run.", "")
-                    state["error"] = str(payload.get("message") or event_type)
-                    _save_run_state(session, state)
-                    html = str(Div(state["error"], cls="error-msg"))
-                    yield dict(data=f"{html}{str(oob_log)}", event="message")
-                    break
-
-                else:
-                    _save_run_state(session, state)
-                    yield dict(data=str(oob_log), event="message")
+                yield dict(data=f"{str(body)}{str(oob_log)}", event="message")
         except Exception as e:
             LOG.exception("sse stream error run_id=%s", run_id)
-            yield dict(data=f'<div class="error-msg">Stream Error: {str(e)}</div>', event="message")
+            body = render_assistant_body(
+                run_id=run_id,
+                text=str(state.get("text") or ""),
+                stage=str(state.get("stage") or "failed"),
+                error=f"Stream Error: {str(e)}",
+                terminal=True,
+                swap_oob_target=f"outerHTML:#run-{run_id}",
+            )
+            shim = render_stream_shim(
+                run_id=run_id,
+                active=False,
+                swap_oob_target=f"outerHTML:#run-stream-{run_id}",
+            )
+            yield dict(data=f"{str(body)}{str(shim)}", event="message")
 
     return EventSourceResponse(event_generator())
 
@@ -875,17 +1125,55 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", af
         return Div("Session unavailable.", cls="error-msg")
 
     run_id = str(run_id or _current_run_id(session)).strip()
-    mode = str(mode or "once").strip().lower()
+    mode = str(mode or "history").strip().lower()
     after_seq = int(after_seq or 0)
+    if mode == "once":
+        mode = "history"
 
     if not run_id:
         return Div("Enter a run id to inspect its events.", cls="fallback-text")
 
     _set_last_run_id(session, run_id)
+    token = session.get("token")
+    _trace_route(
+        "get_debug_run_events",
+        run_id=run_id,
+        mode=mode,
+        after_seq=after_seq,
+        panel_mode=str(_load_panel_state(session).get("mode") or "history"),
+        terminal=bool(_load_run_state(session, run_id).get("terminal")),
+        has_state=_has_run_state(session, run_id),
+    )
+    if token and not _has_run_state(session, run_id):
+        await _hydrate_run_state_once(session, token, run_id)
     debug_state = _load_debug_state(session, run_id)
+    panel_state = _load_panel_state(session)
+    panel_state["run_id"] = run_id
+    if bool(_load_run_state(session, run_id).get("terminal")):
+        panel_state["mode"] = "history"
+        _save_panel_state(session, panel_state)
 
     if mode == "live":
-        # Mark the stream as active again and resume from the requested seq.
+        if bool(_load_run_state(session, run_id).get("terminal")):
+            panel_state["mode"] = "history"
+            panel_state["paused"] = False
+            debug_state["paused"] = False
+            debug_state["resume_seq"] = int(_load_run_state(session, run_id).get("last_seq") or 0)
+            _save_debug_state(session, run_id, debug_state)
+            _save_panel_state(session, panel_state)
+            return (
+                _render_debug_window(
+                    run_id=run_id,
+                    session=session,
+                    events=list(_load_run_state(session, run_id).get("events") or []),
+                    live=False,
+                    source="terminal",
+                ),
+                _render_controls_oob(session, run_id),
+            )
+
+        panel_state["mode"] = "live"
+        panel_state["paused"] = False
         debug_state["paused"] = False
         debug_state["resume_seq"] = (
             after_seq
@@ -894,23 +1182,27 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", af
         )
         debug_state["cleared"] = False
         _save_debug_state(session, run_id, debug_state)
+        _save_panel_state(session, panel_state)
 
-        # The debug shell stays in the right panel while SSE appends log rows.
-        return _render_debug_window(
-            run_id=run_id,
-            session=session,
-            events=list(_load_run_state(session, run_id).get("events") or []),
-            live=True,
-            source="live",
+        return (
+            _render_debug_window(
+                run_id=run_id,
+                session=session,
+                events=list(_load_run_state(session, run_id).get("events") or []),
+                live=True,
+                source="live",
+            ),
+            _render_controls_oob(session, run_id),
         )
 
     state = _load_run_state(session, run_id)
     events = list(state.get("events") or [])
     source = "session"
+    panel_state["mode"] = "history"
+    panel_state["paused"] = False
     debug_state["cleared"] = False
 
     if not events:
-        token = session.get("token")
         if not token:
             return Div("Authentication expired.", cls="error-msg")
 
@@ -929,33 +1221,37 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", af
     debug_state["paused"] = False
     debug_state["resume_seq"] = int(state.get("last_seq") or 0)
     _save_debug_state(session, run_id, debug_state)
+    _save_panel_state(session, panel_state)
 
-    return _render_debug_window(
-        run_id=run_id,
-        session=session,
-        events=events,
-        live=False,
-        source=source,
+    return (
+        _render_debug_window(
+            run_id=run_id,
+            session=session,
+            events=events,
+            live=False,
+            source=source,
+        ),
+        _render_controls_oob(session, run_id),
     )
 
-    event_rows = _render_debug_event_rows(run_id, events)
-    if not event_rows:
-        event_rows = [Div("No events were found for this run.", cls="fallback-text", style="padding: 0.75rem;")]
+    # event_rows = _render_debug_event_rows(run_id, events)
+    # if not event_rows:
+    #     event_rows = [Div("No events were found for this run.", cls="fallback-text", style="padding: 0.75rem;")]
 
-    status_bits = [
-        f"source: {source}",
-        f"seq: {int(state.get('last_seq') or 0)}",
-    ]
-    if state.get("terminal"):
-        status_bits.insert(0, f"terminal: {state.get('stage') or 'done'}")
-    elif state.get("stage"):
-        status_bits.insert(0, f"stage: {state.get('stage')}")
+    # status_bits = [
+    #     f"source: {source}",
+    #     f"seq: {int(state.get('last_seq') or 0)}",
+    # ]
+    # if state.get("terminal"):
+    #     status_bits.insert(0, f"terminal: {state.get('stage') or 'done'}")
+    # elif state.get("stage"):
+    #     status_bits.insert(0, f"stage: {state.get('stage')}")
 
-    return Div(
-        Div(f"Run {run_id}", cls="debug-status-line"),
-        Div(" · ".join(status_bits), cls="text-dim", style="margin-bottom: 0.5rem; font-size: 0.8rem;"),
-        Div(*event_rows, cls="debug-event-list", style="display: flex; flex-direction: column; gap: 0.5rem;"),
-    )
+    # return Div(
+    #     Div(f"Run {run_id}", cls="debug-status-line"),
+    #     Div(" · ".join(status_bits), cls="text-dim", style="margin-bottom: 0.5rem; font-size: 0.8rem;"),
+    #     Div(*event_rows, cls="debug-event-list", style="display: flex; flex-direction: column; gap: 0.5rem;"),
+    # )
 
 
 @rt("/debug/run-events/{run_id}/stream")
@@ -970,14 +1266,70 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0):
         return EventSourceResponse(expired_gen())
 
     state = _load_run_state(session, run_id)
+    _trace_route(
+        "get_debug_run_events_stream",
+        run_id=run_id,
+        after_seq=after_seq,
+        terminal=bool(state.get("terminal")),
+        panel_mode=str(_load_panel_state(session).get("mode") or "history"),
+        has_state=_has_run_state(session, run_id),
+    )
     _set_last_run_id(session, run_id)
+    if not _has_run_state(session, run_id):
+        state = await _hydrate_run_state_once(session, token, run_id)
     start_seq = int(after_seq or _debug_resume_seq(session, run_id) or 0)
+    panel_state = _load_panel_state(session)
+    panel_state["run_id"] = run_id
+
+    if not bool(state.get("terminal")):
+        try:
+            run = await graph_api.get_run(token, run_id)
+            if bool(run.get("terminal")):
+                state["terminal"] = True
+                state["stage"] = str(run.get("status") or state.get("stage") or "completed")
+                _save_run_state(session, state)
+                panel_state["mode"] = "history"
+                panel_state["paused"] = False
+                _save_panel_state(session, panel_state)
+                LOG.info("debug live fallback run_id=%s status=%s", run_id, state["stage"])
+                async def terminal_gen():
+                    yield dict(
+                        data=f"{str(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{str(_render_controls_oob(session, run_id))}",
+                        event="message",
+                    )
+
+                return EventSourceResponse(terminal_gen())
+        except Exception:
+            LOG.exception("failed to fetch debug run status fallback run_id=%s", run_id)
+
+    if bool(state.get("terminal")):
+        panel_state["mode"] = "history"
+        panel_state["paused"] = False
+        debug_state = _load_debug_state(session, run_id)
+        debug_state["paused"] = False
+        debug_state["resume_seq"] = int(state.get("last_seq") or 0)
+        _save_debug_state(session, run_id, debug_state)
+        _save_panel_state(session, panel_state)
+        async def terminal_gen():
+            yield dict(
+                data=f"{str(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{str(_render_controls_oob(session, run_id))}",
+                event="message",
+            )
+
+        return EventSourceResponse(terminal_gen())
+
+    panel_state["mode"] = "live"
+    panel_state["paused"] = False
+    _save_panel_state(session, panel_state)
 
     async def event_generator():
         try:
             async for event in graph_api.stream_events(token, run_id, after_seq=start_seq):
                 seq, event_type, payload, label, detail = _ingest_run_event(state, event)
                 _save_run_state(session, state)
+                debug_state = _load_debug_state(session, run_id)
+                debug_state["resume_seq"] = int(state.get("last_seq") or seq)
+                _save_debug_state(session, run_id, debug_state)
 
                 oob_log = render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail)
                 banner = Div(f"Watching run {run_id} · {label} #{seq}", cls="debug-status-line")
@@ -985,13 +1337,22 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0):
                 # The banner keeps the SSE target alive while the rows append into
                 # the shared `#events-window` panel via HTMX out-of-band swaps.
                 if event_type in {"run.completed", "run.failed", "run.cancelled"}:
-                    yield dict(data=f"{banner}{str(oob_log)}", event="message")
+                    panel_state["mode"] = "history"
+                    panel_state["paused"] = False
+                    _save_panel_state(session, panel_state)
+                    yield dict(
+                        data=f"{str(oob_log)}{str(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{str(_render_controls_oob(session, run_id))}",
+                        event="message",
+                    )
                     break
 
-                yield dict(data=f"{banner}{str(oob_log)}", event="message")
+                yield dict(data=str(oob_log), event="message")
         except Exception as exc:
             LOG.exception("debug stream error run_id=%s", run_id)
-            yield dict(data=f'<div class="error-msg">Debug stream error: {str(exc)}</div>', event="message")
+            yield dict(
+                data=f'<div class="error-msg">Debug stream error: {str(exc)}</div>{str(_render_events_window_oob(session, run_id, live=False, source="error"))}{str(_render_controls_oob(session, run_id))}',
+                event="message",
+            )
 
     return EventSourceResponse(event_generator())
 
@@ -1011,4 +1372,24 @@ def get_logout(session):
     return Redirect("/login")
 
 
-serve(port=CHAT_APP_PORT)
+_RELOAD_EXCLUDES = [
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "**/.git/**",
+    "**/.venv/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.swp",
+    "**/*.swo",
+    "**/*.tmp",
+    "**/*.log",
+    "**/*.jsonl",
+    "**/artifacts/**",
+    "chat_app.log",
+]
+
+# Keep hot-reload useful for code and UI edits, but ignore the common noisy
+# files that editors, test runs, and the app itself generate.
+serve(port=CHAT_APP_PORT, reload_excludes=_RELOAD_EXCLUDES)

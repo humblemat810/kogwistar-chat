@@ -85,15 +85,18 @@ def Sidebar(conversations=None):
     return Aside(
         Div(
             H2("History", cls="sidebar-title"),
-            Ul(*conv_items, cls="conv-list", id="conversation-list"),
-            cls="sidebar-content",
+            cls="panel-head",
+        ),
+        Div(
+            Ul(*conv_items, cls="conv-list scroll-area", id="conversation-list"),
+            cls="panel-body",
         ),
         Div(
             Button("+ New Chat", cls="btn-vibrant block-btn", hx_post="/new-chat"),
             A("Logout", href="/logout", cls="logout-link"),
-            cls="sidebar-footer",
+            cls="panel-foot sidebar-footer",
         ),
-        cls="panel sidebar-panel shadow-premium",
+        cls="panel panel-left sidebar-panel shadow-premium",
     )
 
 
@@ -105,6 +108,106 @@ def render_user_message(*, username: str, message: str):
         Div(message, cls="msg-body user-msg shadow-premium"),
         cls="chat-message-container align-right",
     )
+
+
+def render_assistant_body(
+    *,
+    run_id: str,
+    text: str = "",
+    stage: str | None = None,
+    error: str | None = None,
+    poll_url: str | None = None,
+    poll_interval_ms: int = 750,
+    sse_url: str | None = None,
+    swap_oob_target: str | None = None,
+    terminal: bool = False,
+):
+    """Render the replaceable inner assistant bubble.
+
+    This is the element HTMX polling replaces via `outerHTML`, and it is also
+    the element we replace out-of-band from SSE terminal events. Keeping this
+    as a dedicated function avoids the old mismatch where polling targeted the
+    inner node but the server returned the whole outer chat container.
+    """
+
+    stream_mode = "static"
+    if poll_url:
+        stream_mode = "poll"
+    elif sse_url:
+        stream_mode = "sse"
+
+    attrs = {
+        "id": f"run-{run_id}",
+        "cls": "msg-body assistant-msg streaming-content shadow-premium",
+        "data_run_id": run_id,
+        "data_stream_mode": stream_mode,
+        "data_poll_url": str(poll_url or ""),
+        "data_sse_url": str(sse_url or ""),
+        "data_terminal": "true" if terminal else "false",
+        "data_route_source": "assistant-bubble",
+    }
+    if poll_url:
+        attrs.update(
+            {
+                "hx_get": poll_url,
+                "hx_trigger": f"every {int(poll_interval_ms)}ms",
+                "hx_swap": "outerHTML",
+            }
+        )
+    if swap_oob_target:
+        attrs["hx_swap_oob"] = swap_oob_target
+
+    if error:
+        content = Div(error, cls="error-msg")
+    elif text:
+        content = render_assistant_text(text)
+    else:
+        content = render_thinking_state(run_id=run_id, stage=stage)
+
+    status_bits = [stream_mode.upper()]
+    if terminal:
+        status_bits.append("done")
+    elif stage:
+        status_bits.append(str(stage))
+
+    return Div(
+        Div(
+            Span(" | ".join(status_bits), cls="assistant-transport-label"),
+            cls="assistant-transport-row",
+        ),
+        Div(content, cls="assistant-content"),
+        **attrs,
+    )
+
+
+def render_stream_shim(
+    *,
+    run_id: str,
+    sse_url: str | None = None,
+    active: bool = True,
+    swap_oob_target: str | None = None,
+):
+    """Render the hidden SSE transport node for one assistant run.
+
+    HTMX's SSE extension reconnects on the element that owns `sse_connect`.
+    Keeping that behavior on a small hidden shim lets us replace the visible
+    bubble independently and remove the shim on terminal events.
+    """
+
+    attrs = {
+        "id": f"run-stream-{run_id}",
+        "cls": "stream-transport-shim",
+        "data_run_id": run_id,
+        "data_stream_mode": "sse" if active else "static",
+        "data_sse_url": str(sse_url or ""),
+        "data_route_source": "assistant-stream-shim",
+        "aria_hidden": "true",
+    }
+    if active and sse_url:
+        attrs.update({"hx_ext": "sse", "sse_connect": sse_url, "sse_swap": "message"})
+    if swap_oob_target:
+        attrs["hx_swap_oob"] = swap_oob_target
+    return Div("", **attrs)
 
 
 def render_assistant_container(
@@ -119,39 +222,23 @@ def render_assistant_container(
 ):
     """Render the assistant message container.
 
-    This wrapper holds the actual assistant body and also attaches the HTMX
-    behavior that keeps the message updated:
-
-    - `poll_url` enables polling mode using `hx_get` + `hx_trigger`
-    - `sse_url` enables SSE mode using the HTMX SSE extension
-
-    Only one of those modes is active at a time.
+    The outer wrapper stays stable in the chat transcript. The inner body is
+    the part that polling or SSE updates while the message is streaming.
     """
-
-    attrs = {"id": f"run-{run_id}", "cls": "msg-body assistant-msg streaming-content shadow-premium"}
-    if poll_url:
-        # HTMX polling mode: the browser re-requests the fragment every N ms.
-        attrs.update(
-            {
-                "hx_get": poll_url,
-                "hx_trigger": f"every {int(poll_interval_ms)}ms",
-                "hx_swap": "outerHTML",
-            }
-        )
-    if sse_url:
-        # SSE mode: the HTMX SSE extension listens to the server push channel.
-        attrs.update({"hx_ext": "sse", "sse_connect": sse_url, "sse_swap": "message"})
-
-    if error:
-        body = Div(error, cls="error-msg")
-    elif text:
-        body = render_assistant_text(text)
-    else:
-        body = render_thinking_state(run_id=run_id, stage=stage)
 
     return Div(
         Div("Assistant", cls="msg-sender"),
-        Div(body, **attrs),
+        render_assistant_body(
+            run_id=run_id,
+            text=text,
+            stage=stage,
+            error=error,
+            poll_url=poll_url,
+            poll_interval_ms=poll_interval_ms,
+            sse_url=sse_url,
+            terminal=bool(error or text) and not poll_url and not sse_url and stage in {"completed", "failed", "cancelled"},
+        ),
+        render_stream_shim(run_id=run_id, sse_url=sse_url, active=bool(sse_url)) if sse_url else "",
         cls="chat-message-container align-left",
     )
 
@@ -162,7 +249,7 @@ def render_event_log_item(
     seq: int,
     label: str,
     detail: str = "",
-    swap_oob_target: str | None = "afterbegin:#events-window",
+    swap_oob_target: str | None = "beforeend:#events-window",
 ):
     """Render one event row in the right-hand event log.
 
@@ -178,6 +265,137 @@ def render_event_log_item(
         id=f"evt-{run_id}-{seq}",
         cls="event-log-item shadow-premium",
         **({"hx_swap_oob": swap_oob_target} if swap_oob_target else {}),
+    )
+
+
+def render_right_panel_controls(
+    *,
+    current_run_id: str = "",
+    mode: str = "history",
+    paused: bool = False,
+    resume_seq: int = 0,
+    terminal: bool = False,
+    swap_oob_target: str | None = None,
+):
+    """Render the single control surface for the right panel."""
+
+    is_live = str(mode or "history") == "live"
+    suspend_label = f"Resume from #{resume_seq}" if paused else "Suspend SSE"
+    attrs = {
+        "id": "debug-panel-controls",
+        "cls": "panel-head debug-panel-controls",
+        "data_debug_mode": "live" if is_live else "history",
+        "data_debug_paused": "true" if paused else "false",
+        "data_resume_seq": str(int(resume_seq or 0)),
+        "data_route_source": "debug-panel-controls",
+    }
+    if swap_oob_target:
+        attrs["hx_swap_oob"] = swap_oob_target
+
+    return Div(
+        H2("Agent Events", cls="sidebar-title"),
+        P(
+            "Inspect one run in history or live mode.",
+            cls="text-dim",
+            style="margin-top: -0.5rem; margin-bottom: 0.75rem; font-size: 0.85rem;",
+        ),
+        Form(
+            hx_get="/debug/run-events",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            id="debug-control-form",
+            cls="debug-run-form",
+            data_debug_mode="live" if is_live else "history",
+            data_debug_paused="true" if paused else "false",
+            data_route_source="debug-control-form",
+        )(
+            Label(
+                "Run ID",
+                Input(
+                    name="run_id",
+                    id="debug-run-id",
+                    value=str(current_run_id or ""),
+                    placeholder="run_...",
+                    cls="chat-input",
+                    style="width: 100%;",
+                ),
+                style="display: grid; gap: 0.25rem; font-size: 0.85rem;",
+            ),
+            Input(type="hidden", name="after_seq", id="debug-after-seq", value=str(int(resume_seq or 0))),
+            Div(
+                Button(
+                    "History",
+                    type="submit",
+                    name="mode",
+                    value="history",
+                    data_route_source="debug-controls-history",
+                    cls=("btn-vibrant" if not is_live else "btn-mini btn-outline"),
+                ),
+                Button(
+                    "Live SSE",
+                    type="submit",
+                    name="mode",
+                    value="live",
+                    data_route_source="debug-controls-live",
+                    cls=("btn-vibrant" if is_live else "btn-mini btn-outline"),
+                ),
+                Button(
+                    "Clear",
+                    type="button",
+                    data_route_source="debug-controls-clear",
+                    hx_post="/debug/run-events/clear",
+                    hx_include="#debug-control-form",
+                    hx_target="#events-window",
+                    hx_swap="innerHTML",
+                    cls="btn-mini btn-outline",
+                ),
+                Button(
+                    suspend_label,
+                    type="button",
+                    data_route_source="debug-controls-suspend",
+                    hx_post="/debug/run-events/toggle-suspend",
+                    hx_include="#debug-control-form",
+                    hx_target="#events-window",
+                    hx_swap="innerHTML",
+                    cls="btn-mini btn-outline",
+                ),
+                cls="debug-toolbar",
+            ),
+        ),
+        Div(
+            f"Mode: {'Live SSE' if is_live else 'History'}{' (completed)' if terminal else ''}{' (paused)' if paused else ''}",
+            cls="text-dim debug-mode-note",
+        ),
+        **attrs,
+    )
+
+
+def render_right_panel_viewport(
+    *,
+    run_id: str,
+    mode: str = "history",
+    paused: bool = False,
+    source: str = "session",
+    rows: tuple | list = (),
+    status_bits: tuple | list = (),
+    live_url: str | None = None,
+    swap_oob_target: str | None = None,
+):
+    """Render the viewport content only, without duplicating the toolbar."""
+
+    attrs = {"cls": "debug-events-content"}
+    if swap_oob_target:
+        attrs["hx_swap_oob"] = swap_oob_target
+
+    return Div(
+        Div(
+            Div(f"Run {run_id}", cls="debug-status-line"),
+            Div(" | ".join(str(bit) for bit in status_bits), cls="text-dim debug-status-meta"),
+            cls="debug-events-header",
+        ),
+        render_stream_shim(run_id=run_id, sse_url=live_url, active=bool(live_url) and not paused) if mode == "live" else "",
+        Div(*(rows or [Div("No events are loaded for this run.", cls="fallback-text", style="padding: 0.75rem;")]), cls="debug-event-list"),
+        **attrs,
     )
 
 
@@ -210,8 +428,11 @@ def ChatPanel(messages=None, current_conv_id=None):
         )
 
     return Section(
-        Header(H1("GraphRAG Assistant", cls="vibrant-text chat-header")),
-        Div(*msg_elements, id="chat-window", cls="chat-window"),
+        Header(H1("GraphRAG Assistant", cls="vibrant-text chat-header"), cls="panel-head"),
+        Div(
+            Div(*msg_elements, id="chat-window", cls="chat-window scroll-area"),
+            cls="panel-body",
+        ),
         Footer(
             Form(hx_post="/send-message", hx_target="#chat-window", hx_swap="beforeend")(
                 Input(type="hidden", name="conv_id", value=current_conv_id or ""),
@@ -222,13 +443,21 @@ def ChatPanel(messages=None, current_conv_id=None):
                 # After the browser receives the server response, clear the
                 # text field so the user can type the next message immediately.
                 hx_on__after_request="this.querySelector('#message-input').value = ''",
-            )
+            ),
+            cls="panel-foot",
         ),
-        cls="panel center-panel shadow-premium",
+        cls="panel panel-center center-panel shadow-premium",
     )
 
 
-def RightPanel(current_run_id: str | None = None):
+def RightPanel(
+    current_run_id: str | None = None,
+    *,
+    mode: str = "history",
+    paused: bool = False,
+    resume_seq: int = 0,
+    terminal: bool = False,
+):
     """Render the event stream panel on the right side.
 
     The top form is a small debug tool. It lets us reuse the same backend run
@@ -239,53 +468,31 @@ def RightPanel(current_run_id: str | None = None):
     run_id = str(current_run_id or "").strip()
 
     return Aside(
-        H2("Agent Events", cls="sidebar-title"),
-        P("Debug a run without sending a new message.", cls="text-dim", style="margin-top: -0.5rem; margin-bottom: 0.75rem; font-size: 0.85rem;"),
-        Form(
-            hx_get="/debug/run-events",
-            hx_target="#events-window",
-            hx_swap="innerHTML",
-            cls="debug-run-form",
-            style="display: grid; gap: 0.5rem; margin-bottom: 0.75rem;",
-        )(
-            Label(
-                "Run ID",
-                Input(
-                    name="run_id",
-                    value=run_id,
-                    placeholder="run_...",
-                    cls="chat-input",
-                    style="width: 100%;",
+        render_right_panel_controls(
+            current_run_id=run_id,
+            mode=mode,
+            paused=paused,
+            resume_seq=resume_seq,
+            terminal=terminal,
+        ),
+        Div(
+            Div(
+                Div(
+                    "Pick a run and click a debug button.",
+                    cls="fallback-text",
+                    style="padding: 0.75rem;",
                 ),
-                style="display: grid; gap: 0.25rem; font-size: 0.85rem;",
+                id="events-window",
+                cls="events-window scroll-area",
+                tabindex="0",
             ),
-            Div(
-                Button("Load Events Once", type="submit", name="mode", value="once", cls="btn-vibrant"),
-                Button("Watch Live", type="submit", name="mode", value="live", cls="btn-mini btn-outline"),
-                style="display: flex; gap: 0.5rem; flex-wrap: wrap;",
-            ),
+            cls="panel-body",
         ),
-        Div(
-            "The event list below updates independently of the chat transcript.",
-            cls="text-dim",
-            style="margin-bottom: 0.5rem; font-size: 0.8rem;",
-        ),
-        Div(
-            Div(
-                "Pick a run and click a debug button.",
-                cls="fallback-text",
-                style="padding: 0.75rem;",
-            ),
-            id="events-window",
-            cls="events-window",
-            tabindex="0",
-            style="flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 0.5rem; scroll-behavior: smooth;",
-        ),
-        cls="panel right-panel shadow-premium",
+        cls="panel panel-right right-panel shadow-premium",
     )
 
 
 def ThreePanelLayout(*c):
     """Wrap the three panels in the page-level main container."""
 
-    return Main(*c, cls="layout-3-panel container", id="main-content")
+    return Main(*c, cls="app-shell", id="main-content")

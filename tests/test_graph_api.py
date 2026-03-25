@@ -5,11 +5,15 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 # Keep the repo root importable when pytest executes from the tests directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import graph_api as graph_api_mod
 from graph_api import GraphAPI
+
+pytestmark = pytest.mark.ci
 
 
 class _FakeEventSource:

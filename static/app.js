@@ -73,36 +73,137 @@ function logHtmxEvent(name, detail) {
     }
 }
 
-function focusEventsWindow() {
-    // The event panel is a scroll box; keep the newest debug state visible and
-    // make it easy to inspect with the keyboard if the user clicks into it.
-    const windowEl = document.getElementById('events-window');
-    if (!windowEl) {
-        return;
+function bubbleMeta(el) {
+    if (!el) {
+        return null;
     }
 
-    windowEl.focus({ preventScroll: true });
-    windowEl.scrollTop = 0;
+    const target = el.dataset?.runId ? el : el.closest?.('[data-run-id]');
+    if (!target) {
+        return null;
+    }
+
+    return {
+        runId: target.dataset.runId || '',
+        mode: target.dataset.streamMode || 'static',
+        pollUrl: target.dataset.pollUrl || '',
+        sseUrl: target.dataset.sseUrl || '',
+        terminal: target.dataset.terminal === 'true',
+        routeSource: target.dataset.routeSource || '',
+    };
 }
 
-let eventsWindowScrollQueued = false;
+function requestMeta(elt) {
+    if (!elt) {
+        return {};
+    }
 
-function queueEventsWindowFocus() {
-    if (eventsWindowScrollQueued) {
+    return {
+        routeSource: elt.dataset?.routeSource || elt.closest?.('[data-route-source]')?.dataset?.routeSource || '',
+        hxGet: elt.getAttribute?.('hx-get') || '',
+        hxPost: elt.getAttribute?.('hx-post') || '',
+        hxTrigger: elt.getAttribute?.('hx-trigger') || '',
+        hxTarget: elt.getAttribute?.('hx-target') || '',
+        id: elt.id || '',
+        tag: elt.tagName || '',
+    };
+}
+
+function logBubbleLifecycle(name, el, extra = {}) {
+    const meta = bubbleMeta(el);
+    if (!meta) {
         return;
     }
 
-    eventsWindowScrollQueued = true;
+    logHtmxEvent(`bubble:${name}`, { ...meta, ...extra });
+}
+
+function getEventsWindow() {
+    return document.getElementById('events-window');
+}
+
+function isNearBottom(el, threshold = 72) {
+    if (!el) {
+        return false;
+    }
+
+    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+    return remaining <= threshold;
+}
+
+const debugViewportState = {
+    autoFollow: true,
+    bound: false,
+};
+
+function bindEventsWindow() {
+    const windowEl = getEventsWindow();
+    if (!windowEl || debugViewportState.bound) {
+        return;
+    }
+
+    windowEl.addEventListener('scroll', () => {
+        debugViewportState.autoFollow = isNearBottom(windowEl);
+    });
+    debugViewportState.bound = true;
+}
+
+let eventsWindowFollowQueued = false;
+
+function queueEventsWindowFollow() {
+    if (eventsWindowFollowQueued) {
+        return;
+    }
+
+    eventsWindowFollowQueued = true;
     requestAnimationFrame(() => {
-        eventsWindowScrollQueued = false;
-        focusEventsWindow();
+        eventsWindowFollowQueued = false;
+        const windowEl = getEventsWindow();
+        if (!windowEl || !debugViewportState.autoFollow) {
+            return;
+        }
+
+        windowEl.scrollTop = windowEl.scrollHeight;
+    });
+}
+
+function announceAssistantBubbles(root) {
+    const scope = root?.querySelectorAll ? root : document;
+    const bubbles = scope.querySelectorAll ? scope.querySelectorAll('.streaming-content[data-run-id]') : [];
+
+    bubbles.forEach((bubble) => {
+        if (bubble.dataset.bubbleAnnounced === 'true') {
+            return;
+        }
+
+        bubble.dataset.bubbleAnnounced = 'true';
+        logBubbleLifecycle('mode-selected', bubble);
+    });
+}
+
+function logDebugControls(root) {
+    const controls = root?.id === 'debug-panel-controls'
+        ? root
+        : root?.querySelector?.('#debug-panel-controls') || document.getElementById('debug-panel-controls');
+
+    if (!controls) {
+        return;
+    }
+
+    logHtmxEvent('debug:controls', {
+        runId: controls.querySelector?.('#debug-run-id')?.value || '',
+        mode: controls.dataset.debugMode || 'history',
+        paused: controls.dataset.debugPaused === 'true',
+        resumeSeq: controls.dataset.resumeSeq || '0',
     });
 }
 
 document.addEventListener('htmx:beforeRequest', (evt) => {
     // Helpful when debugging which fragment HTMX is about to fetch.
     const path = evt.detail?.pathInfo?.requestPath || evt.detail?.requestConfig?.path || 'unknown';
-    logHtmxEvent('beforeRequest', { path, elt: evt.detail?.elt?.id || evt.detail?.elt?.tagName });
+    const req = requestMeta(evt.detail?.elt);
+    logHtmxEvent('beforeRequest', { path, ...req });
+    logBubbleLifecycle('before-request', evt.detail?.elt, { path, ...req });
 });
 
 document.addEventListener('htmx:afterRequest', (evt) => {
@@ -111,16 +212,26 @@ document.addEventListener('htmx:afterRequest', (evt) => {
         status: xhr?.status,
         path: evt.detail?.pathInfo?.requestPath || evt.detail?.requestConfig?.path || 'unknown',
         successful: evt.detail?.successful,
+        ...requestMeta(evt.detail?.elt),
+    });
+    logBubbleLifecycle('after-request', evt.detail?.elt, {
+        status: xhr?.status,
+        successful: evt.detail?.successful,
+        ...requestMeta(evt.detail?.elt),
     });
 });
 
 document.addEventListener('htmx:sseOpen', (evt) => {
     // Fires when the HTMX SSE extension opens the server-push connection.
-    logHtmxEvent('sseOpen', { sourceUrl: evt.detail?.source?.url || 'unknown' });
+    logHtmxEvent('sseOpen', { sourceUrl: evt.detail?.source?.url || 'unknown', ...requestMeta(evt.detail?.elt || evt.detail?.source) });
+    logBubbleLifecycle('sse-open', evt.detail?.elt || evt.detail?.source, {
+        sourceUrl: evt.detail?.source?.url || 'unknown',
+    });
 });
 
 document.addEventListener('htmx:sseError', (evt) => {
-    console.warn('[HTMX:SSE] error', evt.detail || {});
+    console.warn('[HTMX:SSE] error', { ...requestMeta(evt.detail?.elt || evt.detail?.source), ...(evt.detail || {}) });
+    logBubbleLifecycle('sse-error', evt.detail?.elt || evt.detail?.source, evt.detail || {});
 });
 
 document.addEventListener('htmx:sseMessage', function (evt) {
@@ -151,23 +262,33 @@ document.addEventListener('htmx:sseMessage', function (evt) {
         }
     });
 
-    // Debug SSE rows land in the right-hand panel. Scroll the panel so the
-    // latest inserted content stays visible while you inspect the stream.
+    logBubbleLifecycle('sse-message', evt.detail?.elt || evt.detail?.source);
+    logHtmxEvent('sseMessage', { ...requestMeta(evt.detail?.elt || evt.detail?.source) });
     if (el && el.closest && el.closest('#events-window')) {
-        queueEventsWindowFocus();
+        queueEventsWindowFollow();
     }
 });
 
 document.addEventListener('htmx:afterSwap', (evt) => {
-    // HTMX out-of-band swaps do not always go through the same callback as the
-    // SSE extension, so we nudge the scroll box after any swap that touches it.
     const target = evt.detail?.target || evt.target;
+
+    bindEventsWindow();
+    announceAssistantBubbles(target);
+    logBubbleLifecycle('after-swap', target);
+    logDebugControls(target);
+
+    if (target?.dataset?.terminal === 'true') {
+        logBubbleLifecycle('terminal-detected', target);
+    }
+
     if (target && (target.id === 'events-window' || target.closest?.('#events-window'))) {
-        queueEventsWindowFocus();
+        queueEventsWindowFollow();
     }
 });
 
 document.addEventListener('DOMContentLoaded', () => {
-    // If the page loads with an already-populated debug panel, keep it focused.
-    queueEventsWindowFocus();
+    bindEventsWindow();
+    announceAssistantBubbles(document);
+    logDebugControls(document);
+    queueEventsWindowFollow();
 });

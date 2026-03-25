@@ -71,3 +71,17 @@ Then open:
 - If login redirects fail, confirm `CHAT_APP_URL` matches the browser address exactly.
 - If conversations do not load, verify `GRAPHRAG_SERVER_URL` is reachable.
 - If streaming does not work, try `CHAT_STREAM_MODE=poll` first, since it is the more tolerant fallback mode.
+
+## HTMX/SSE Transport Pitfalls
+
+- Polling only stops when the server returns replacement HTML without `hx_get`. Setting terminal state in Python is not enough if the rendered fragment still carries a poll URL.
+- SSE routes must keep returning SSE responses all the way through terminal handling. If a route mounted by HTMX SSE returns plain HTML, the browser treats it as a broken stream and reconnects repeatedly.
+- Historical runs can be missing from the current browser session. On the first inspection of an older run, the frontend should do one backend hydrate and persist `terminal`, `stage`, `last_seq`, and events before deciding whether to open live SSE.
+- A saved debug panel can remember `mode=live` across reloads. If the selected run is already terminal, the server must overwrite the panel back to `history` and not leave a live shim in the DOM.
+- The same stale-state issue applies to the assistant bubble. Once a run is terminal, the rendered bubble must remove `poll_url` so HTMX no longer emits interval requests.
+
+## Recommended Debug Signals
+
+- Watch `chat_app.log` for route-entry traces from `main.py`. The useful fields are `route`, `run_id`, `after_seq`, `terminal`, `panel_mode`, and `has_state`.
+- In the browser console, use the `data_route_source` annotations to tell whether a request came from the assistant poll bubble, the assistant SSE shim, or the right-panel debug controls.
+- If a route keeps firing, inspect the returned HTML fragment. Look specifically for `hx_get`, `sse_connect`, and any remaining live shim element.
