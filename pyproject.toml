@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "htmxchat"
+name = "kogwistar-htmxchat"
 version = "0.1.0"
-description = "FastHTML + HTMX + SSE chat demo"
+description = "FastHTML + HTMX + SSE chat substrate with a client-side Pyodide worker"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -23,6 +23,10 @@ dev = [
     "pytest",
     "mypy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/humblemat810/kogwistar"
+Repository = "https://github.com/humblemat810/kogwistar"
 
 [tool.setuptools]
 py-modules = ["main", "graph_api", "components", "sse_contracts", "app_contracts"]
