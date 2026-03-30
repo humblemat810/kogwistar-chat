@@ -1,7 +1,11 @@
 # kogwistar-htmxchat
-This repo works with kogwistar repo 
+This repo works with kogwistar repo https://github.com/humblemat810/kogwistar
+<p align="center">
+    <img src="assets/kogwistar_256.png" width="200"/>
+</p>
 
-https://github.com/humblemat810/kogwistar
+
+
 
 `htmxchat` is a FastHTML + HTMX chat application that demonstrates a full Python stack with live assistant streaming and a client-side Pyodide worker for running arbitrary Python scripts.
 
@@ -9,7 +13,7 @@ This repo serves two goals:
 
 1. Show that the substrate works. The app is built to prove the server-side rendering, HTMX partial updates, and SSE transport can support real interactive workflows.
 2. Experiment with agent-style execution. The browser includes a Pyodide worker so Python snippets can be queued, approved, cancelled, and executed on the client side.
-
+![screenshot](assets\screenshot.png)
 ## What This Project Does
 
 - Renders the entire UI from Python using FastHTML.
