@@ -1473,6 +1473,7 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) 
     panel_state["mode"] = "live"
     panel_state["paused"] = False
     _save_panel_state(session, panel_state)
+    stream_started_at = time.perf_counter()
     _trace_sse_server(
         "debug-live-open",
         run_id=run_id,
