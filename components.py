@@ -161,6 +161,8 @@ def render_assistant_body(
         content = Div(error, cls="error-msg")
     elif text:
         content = render_assistant_text(text)
+    elif terminal:
+        content = Div("Completed", cls="assistant-complete")
     else:
         content = render_thinking_state(run_id=run_id, stage=stage)
 

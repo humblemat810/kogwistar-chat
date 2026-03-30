@@ -98,6 +98,34 @@ def test_run_state_save_strips_event_history_from_session():
     assert reloaded["events"][0]["event_type"] == "output.delta"
 
 
+def test_output_completed_event_uses_data_payload_for_final_text():
+    session = Session()
+    run_id = "run-output-completed"
+    main._init_run_state(session, run_id=run_id, conv_id="conv-output", user_text="hello")
+    state = main._load_run_state(session, run_id)
+
+    seq, event_type, payload, label, detail = main._ingest_run_event(
+        state,
+        {"seq": 1, "event_type": "output.completed", "data": "final answer from data"},
+    )
+
+    assert seq == 1
+    assert event_type == "output.completed"
+    assert payload["data"] == "final answer from data"
+    assert label == "Output.completed"
+    assert "final answer" in detail
+    assert state["text"] == "final answer from data"
+    assert state["stage"] == "completed"
+
+
+def test_terminal_assistant_body_does_not_show_thinking_placeholder():
+    body = main.render_assistant_body(run_id="run-terminal", terminal=True)
+
+    rendered = repr(body)
+    assert "Completed" in rendered
+    assert "Thinking" not in rendered
+
+
 def test_debug_live_mode_falls_back_for_terminal_runs(monkeypatch):
     session = Session(token="token-1")
     run_id = "run-terminal"

@@ -49,6 +49,7 @@ class DebugRunState(TypedDict):
 
 
 class SessionData(TypedDict, total=False):
+    auth_key: str
     token: str
     username: str
     user_id: str

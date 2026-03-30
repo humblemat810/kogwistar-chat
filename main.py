@@ -18,6 +18,7 @@ HTML fragments instead of JSON.
 import logging
 import os
 import time
+import uuid
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -74,7 +75,85 @@ logging.basicConfig(
     ]
 )
 LOG = logging.getLogger("htmx.main")
+PAYLOAD_LOG = logging.getLogger("htmx.payload")
+if not PAYLOAD_LOG.handlers:
+    _payload_handler = logging.FileHandler("payload.log", encoding="utf-8")
+    _payload_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+    PAYLOAD_LOG.addHandler(_payload_handler)
+PAYLOAD_LOG.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+PAYLOAD_LOG.propagate = False
 RUN_EVENT_CACHE: dict[str, list[RunEventRecord]] = {}
+AUTH_TOKEN_CACHE: dict[str, str] = {}
+
+
+def _trace_session_size(session: SessionData, *, stage: str, run_id: str | None = None) -> None:
+    """Log an approximate serialized session size for cookie overflow debugging."""
+
+    try:
+        import json
+
+        raw_session = dict(session)
+        approx = len(json.dumps(raw_session, default=str, ensure_ascii=False))
+        key_sizes = ",".join(
+            f"{key}:{len(json.dumps(value, default=str, ensure_ascii=False))}"
+            for key, value in sorted(raw_session.items())
+        )
+    except Exception:
+        approx = -1
+        key_sizes = "unavailable"
+    LOG.info(
+        "session-size stage=%s run_id=%s approx_bytes=%s keys=%s key_bytes=%s",
+        stage,
+        run_id or "",
+        approx,
+        ",".join(sorted(str(key) for key in session.keys())),
+        key_sizes,
+    )
+
+
+def _ensure_auth_key(session: SessionData) -> str:
+    """Return the small cookie-stored key used to look up the real bearer token."""
+
+    auth_key = str(session.get("auth_key") or "").strip()
+    if auth_key:
+        return auth_key
+    auth_key = uuid.uuid4().hex
+    session["auth_key"] = auth_key
+    return auth_key
+
+
+def _store_session_token(session: SessionData, token: str) -> None:
+    """Store the backend bearer token in server memory instead of the cookie."""
+
+    auth_key = _ensure_auth_key(session)
+    AUTH_TOKEN_CACHE[auth_key] = str(token)
+    # Migrate older cookie-backed sessions by removing the legacy token field.
+    session.pop("token", None)
+    _trace_session_size(session, stage="store_session_token")
+
+
+def _get_session_token(session: SessionData) -> str:
+    """Resolve the current bearer token from the server-side cache or legacy session."""
+
+    auth_key = str(session.get("auth_key") or "").strip()
+    if auth_key and auth_key in AUTH_TOKEN_CACHE:
+        return AUTH_TOKEN_CACHE[auth_key]
+
+    legacy_token = str(session.get("token") or "").strip()
+    if legacy_token:
+        _store_session_token(session, legacy_token)
+        return legacy_token
+    return ""
+
+
+def _clear_session_token(session: SessionData) -> None:
+    """Remove the cached auth token for this browser session."""
+
+    auth_key = str(session.get("auth_key") or "").strip()
+    if auth_key:
+        AUTH_TOKEN_CACHE.pop(auth_key, None)
+    session.pop("auth_key", None)
+    session.pop("token", None)
 
 
 def _trace_route(route_name: str, **fields) -> None:
@@ -94,6 +173,41 @@ def _trace_sse_server(stage: str, *, run_id: str, **fields: object) -> None:
         line = f"{line} {extras}"
     LOG.info(line)
     print(line, flush=True)
+
+
+def _trace_payload(stage: str, *, run_id: str, payload: object, **fields: object) -> None:
+    """Write full payload-oriented traces into a separate file for inspection."""
+
+    try:
+        import json
+
+        payload_text = json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        payload_text = str(payload)
+
+    meta = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    PAYLOAD_LOG.info(
+        "stage=%s run_id=%s size=%s %s payload=%s",
+        stage,
+        run_id,
+        len(payload_text),
+        meta,
+        payload_text,
+    )
+
+
+def _render_sse_fragment(node: object) -> str:
+    """Serialize one FastHTML node for SSE delivery.
+
+    `str(node)` on FastHTML elements is too lossy here and collapses into a
+    text-like representation. HTMX SSE needs the rendered HTML fragment.
+    """
+
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    return repr(node)
 
 
 
@@ -191,7 +305,8 @@ def _remember_conversation(session: SessionData, conv_id: str, *, turn_count: in
 def _sync_conversations(session: SessionData, conversations: list[ConversationSummary]) -> list[ConversationSummary]:
     """Replace the cached conversation list with the latest backend data."""
 
-    session["conversations"] = list(conversations or [])[:20]
+    session["conversations"] = list(conversations or [])[:5]
+    _trace_session_size(session, stage="sync_conversations")
     return _session_conversations(session)
 
 
@@ -215,6 +330,7 @@ def _init_run_state(session: SessionData, *, run_id: str, conv_id: str, user_tex
         "mode": CHAT_STREAM_MODE,
     }
     session["run_state"] = runs
+    _trace_session_size(session, stage="init_run_state", run_id=run_id)
     RUN_EVENT_CACHE[run_id] = []
 
 
@@ -250,6 +366,7 @@ def _save_run_state(session: SessionData, state: RunState) -> None:
     slim_state.pop("events", None)
     runs[state["run_id"]] = slim_state
     session["run_state"] = runs
+    _trace_session_size(session, stage="save_run_state", run_id=str(state.get("run_id") or ""))
 
 
 async def _hydrate_run_state_once(session: SessionData, token: str, run_id: str) -> RunState:
@@ -320,6 +437,7 @@ def _save_panel_state(session: SessionData, state: DebugPanelState) -> None:
     """Persist the global right-panel state back into the session."""
 
     session["debug_panel"] = dict(state)
+    _trace_session_size(session, stage="save_panel_state", run_id=str(state.get("run_id") or ""))
 
 
 def _sync_panel_to_run(session: SessionData, run_id: str, *, auto_live: bool = False) -> None:
@@ -349,6 +467,7 @@ def _save_debug_state(session: SessionData, run_id: str, state: DebugRunState) -
     debug_runs = dict(session.get("debug_state") or {})
     debug_runs[run_id] = dict(state)
     session["debug_state"] = debug_runs
+    _trace_session_size(session, stage="save_debug_state", run_id=run_id)
 
 
 def _debug_resume_seq(session: SessionData, run_id: str) -> int:
@@ -482,6 +601,8 @@ def _event_label(event_type: str, payload: dict) -> tuple[str, str]:
         return "Thought", str(payload.get("summary") or "")
     if event_type == "output.delta":
         delta = str(payload.get("delta") or "")
+        if not delta:
+            delta = str(payload.get("data") or "")
         preview = delta.replace("\n", " ").strip()
         if len(preview) > 80:
             preview = preview[:77] + "..."
@@ -492,6 +613,7 @@ def _event_label(event_type: str, payload: dict) -> tuple[str, str]:
             or payload.get("text")
             or payload.get("output")
             or payload.get("content")
+            or payload.get("data")
             or ""
         )
         preview = completed_text.replace("\n", " ").strip()
@@ -547,7 +669,7 @@ def _ingest_run_event(state: RunState, evt: StreamEventPayload) -> tuple[int, st
         if summary:
             state["stage"] = summary
     elif event_type == "output.delta":
-        delta = str(payload.get("delta") or evt.get("delta") or "")
+        delta = str(payload.get("delta") or evt.get("delta") or payload.get("data") or evt.get("data") or "")
         if delta:
             state["text"] = f"{state.get('text', '')}{delta}"
     elif event_type == "output.completed":
@@ -556,7 +678,12 @@ def _ingest_run_event(state: RunState, evt: StreamEventPayload) -> tuple[int, st
             or payload.get("text")
             or payload.get("output")
             or payload.get("content")
+            or payload.get("data")
             or evt.get("assistant_text")
+            or evt.get("text")
+            or evt.get("output")
+            or evt.get("content")
+            or evt.get("data")
             or ""
         )
         if completed_text:
@@ -709,7 +836,7 @@ async def post_cancel(run_id: str, session):
     button on the client side.
     """
 
-    token = session.get("token")
+    token = _get_session_token(session)
     if not token:
         return ""
     success = await graph_api.cancel_run(token, run_id)
@@ -813,7 +940,7 @@ async def _ensure_conversation(session) -> str:
     conv_id = str(session.get("conversation_id") or "").strip()
     if conv_id:
         return conv_id
-    token = session["token"]
+    token = _get_session_token(session)
     user_id = session.get("user_id", "")
     conv_id = await graph_api.create_conversation(token, user_id)
     session["conversation_id"] = conv_id
@@ -832,7 +959,7 @@ async def post_login_dev(session):
         if not token:
             raise ValueError("No token returned from backend")
         
-        session["token"] = token
+        _store_session_token(session, token)
         # Fetch user info for the session
         try:
             me = await graph_api.get_me(token)
@@ -876,7 +1003,7 @@ async def get_home(session, token: str | None = None):
     """
 
     if token:
-        session["token"] = token
+        _store_session_token(session, token)
         try:
             me = await graph_api.get_me(token)
             session["username"] = me.get("display_name") or me.get("email") or me.get("user_id", "User")
@@ -888,10 +1015,10 @@ async def get_home(session, token: str | None = None):
             LOG.exception("failed to fetch /api/auth/me after login")
         return Redirect("/")
 
-    if "token" not in session:
+    token = _get_session_token(session)
+    if not token:
         return Redirect("/login")
 
-    token = session["token"]
     user_id = session.get("user_id", "")
 
     try:
@@ -922,7 +1049,8 @@ async def get_conv(conv_id: str, session, request: Request):
     - only the panel fragments, when HTMX requests the route for a sidebar click
     """
 
-    if "token" not in session:
+    token = _get_session_token(session)
+    if not token:
         return Redirect("/login")
 
     _trace_route(
@@ -932,7 +1060,6 @@ async def get_conv(conv_id: str, session, request: Request):
         panel_run_id=str(_load_panel_state(session).get("run_id") or _current_run_id(session) or ""),
     )
 
-    token = session["token"]
     user_id = session.get("user_id", "")
 
     try:
@@ -986,9 +1113,9 @@ async def get_conv(conv_id: str, session, request: Request):
 async def post_new(session):
     """Create a brand-new conversation and redirect to it."""
 
-    if "token" not in session:
+    token = _get_session_token(session)
+    if not token:
         return Redirect("/login")
-    token = session["token"]
     user_id = session.get("user_id", "")
     conv_id = await graph_api.create_conversation(token, user_id)
     session["conversation_id"] = conv_id
@@ -1005,7 +1132,7 @@ async def post_msg(message: str, conv_id: str, session):
     LOG.info("POST /send-message message_len=%s conv_id=%s", len(text), conv_id)
     if not text:
         return ""
-    token = session.get("token")
+    token = _get_session_token(session)
     if not token:
         LOG.warning("Unauthorized /send-message attempt")
         return Redirect("/login")
@@ -1071,7 +1198,7 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
     updates, and we re-render the assistant bubble each time.
     """
 
-    token = session.get("token")
+    token = _get_session_token(session)
     if not token:
         return render_assistant_body(run_id=run_id, error="Please log in again.", terminal=True)
 
@@ -1158,7 +1285,7 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
     keeps one long-lived connection open and the server pushes each event.
     """
 
-    token = session.get("token")
+    token = _get_session_token(session)
     if not token:
         async def expired_gen():
             yield dict(data='<div class="error-msg">Authentication expired.</div>', event="message")
@@ -1191,7 +1318,7 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                 active=False,
                 swap_oob_target=f"outerHTML:#run-stream-{run_id}",
             )
-            payload = f"{str(body)}{str(shim)}"
+            payload = f"{_render_sse_fragment(body)}{_render_sse_fragment(shim)}"
             _trace_sse_server(
                 "emit-terminal-snapshot",
                 run_id=run_id,
@@ -1212,6 +1339,13 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                     raw_seq=event.get("seq"),
                     raw_event=event.get("event_type") or event.get("type"),
                     elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000),
+                )
+                _trace_payload(
+                    "relay-received",
+                    run_id=run_id,
+                    seq=event.get("seq"),
+                    event_type=event.get("event_type") or event.get("type"),
+                    payload=event,
                 )
                 seq, event_type, payload, label, detail = _ingest_run_event(state, event)
                 push_debug_rows = _should_push_event_to_debug_panel(session, run_id)
@@ -1236,7 +1370,7 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                         active=False,
                         swap_oob_target=f"outerHTML:#run-stream-{run_id}",
                     )
-                    message_html = f"{str(body)}{str(oob_log)}{str(shim)}"
+                    message_html = f"{_render_sse_fragment(body)}{_render_sse_fragment(oob_log)}{_render_sse_fragment(shim)}"
                     _trace_sse_server(
                         "relay-emitting",
                         run_id=run_id,
@@ -1246,10 +1380,17 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                         html_len=len(message_html),
                         elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000),
                     )
+                    _trace_payload(
+                        "relay-emitting",
+                        run_id=run_id,
+                        seq=seq,
+                        event_type=event_type,
+                        payload=message_html,
+                    )
                     yield dict(data=message_html, event="message")
                     break
 
-                message_html = f"{str(body)}{str(oob_log)}"
+                message_html = f"{_render_sse_fragment(body)}{_render_sse_fragment(oob_log)}"
                 _trace_sse_server(
                     "relay-emitting",
                     run_id=run_id,
@@ -1258,6 +1399,13 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                     terminal=False,
                     html_len=len(message_html),
                     elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000),
+                )
+                _trace_payload(
+                    "relay-emitting",
+                    run_id=run_id,
+                    seq=seq,
+                    event_type=event_type,
+                    payload=message_html,
                 )
                 yield dict(data=message_html, event="message")
         except Exception as e:
@@ -1276,7 +1424,7 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                 active=False,
                 swap_oob_target=f"outerHTML:#run-stream-{run_id}",
             )
-            payload = f"{str(body)}{str(shim)}"
+            payload = f"{_render_sse_fragment(body)}{_render_sse_fragment(shim)}"
             _trace_sse_server("relay-emitting-error", run_id=run_id, html_len=len(payload))
             yield dict(data=payload, event="message")
 
@@ -1305,7 +1453,7 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", af
         return Div("Enter a run id to inspect its events.", cls="fallback-text")
 
     _set_last_run_id(session, run_id)
-    token = session.get("token")
+    token = _get_session_token(session)
     _trace_route(
         "get_debug_run_events",
         run_id=run_id,
@@ -1410,7 +1558,7 @@ async def get_debug_run_events(run_id: str | None = None, mode: str = "once", af
 async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) -> EventSourceResponse:
     """Stream a saved run into the debug panel without re-running it."""
 
-    token = session.get("token")
+    token = _get_session_token(session)
     if not token:
         async def expired_gen():
             yield dict(data='<div class="error-msg">Authentication expired.</div>', event="message")
@@ -1492,6 +1640,13 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) 
                     raw_event=event.get("event_type") or event.get("type"),
                     elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000),
                 )
+                _trace_payload(
+                    "debug-live-received",
+                    run_id=run_id,
+                    seq=event.get("seq"),
+                    event_type=event.get("event_type") or event.get("type"),
+                    payload=event,
+                )
                 seq, event_type, payload, label, detail = _ingest_run_event(state, event)
                 _save_run_state(session, state)
                 debug_state = _load_debug_state(session, run_id)
@@ -1512,11 +1667,18 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) 
                         run_id=run_id,
                         seq=seq,
                         event=event_type,
-                        html_len=len(str(oob_log)),
+                        html_len=len(_render_sse_fragment(oob_log)),
                         elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000),
                     )
+                    _trace_payload(
+                        "debug-live-emitting",
+                        run_id=run_id,
+                        seq=seq,
+                        event_type=event_type,
+                        payload=f"{_render_sse_fragment(oob_log)}{_render_sse_fragment(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{_render_sse_fragment(_render_controls_oob(session, run_id))}",
+                    )
                     yield dict(
-                        data=f"{str(oob_log)}{str(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{str(_render_controls_oob(session, run_id))}",
+                        data=f"{_render_sse_fragment(oob_log)}{_render_sse_fragment(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{_render_sse_fragment(_render_controls_oob(session, run_id))}",
                         event="message",
                     )
                     break
@@ -1526,10 +1688,17 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) 
                     run_id=run_id,
                     seq=seq,
                     event=event_type,
-                    html_len=len(str(oob_log)),
+                    html_len=len(_render_sse_fragment(oob_log)),
                     elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000),
                 )
-                yield dict(data=str(oob_log), event="message")
+                _trace_payload(
+                    "debug-live-emitting",
+                    run_id=run_id,
+                    seq=seq,
+                    event_type=event_type,
+                    payload=_render_sse_fragment(oob_log),
+                )
+                yield dict(data=_render_sse_fragment(oob_log), event="message")
         except Exception as exc:
             LOG.exception("debug stream error run_id=%s", run_id)
             _trace_sse_server("debug-live-error", run_id=run_id, error=repr(exc), elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000))
@@ -1552,6 +1721,7 @@ def static_files(path: str):
 def get_logout(session):
     """Clear the session and send the user back to the login screen."""
 
+    _clear_session_token(session)
     session.clear()
     return Redirect("/login")
 
