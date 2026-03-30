@@ -43,8 +43,8 @@ sys.stdout = io.StringIO()
             self.postMessage({
                 type: "result",
                 id,
-                result: result?.toString(),
-                stdout,
+                result: result === undefined || result === null ? "None" : result.toString(),
+                stdout: stdout || "",
                 success: true
             });
         } catch (error) {

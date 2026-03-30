@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
+import json
 import subprocess
 import sys
 from contextlib import suppress
@@ -31,6 +32,23 @@ async def _first_sse_event(response: EventSourceResponse):
     return None
 
 
+async def _collect_timed_sse_events(response: EventSourceResponse, *, limit: int) -> list[tuple[float, dict]]:
+    items: list[tuple[float, dict]] = []
+    loop = asyncio.get_running_loop()
+    async for item in response.body_iterator:
+        items.append((loop.time(), item))
+        if len(items) >= limit:
+            break
+    return items
+
+
+async def _fake_streamed_run_events(events: list[dict], *, delay_s: float = 0.03):
+    for idx, event in enumerate(events):
+        if idx:
+            await asyncio.sleep(delay_s)
+        yield event
+
+
 def _make_terminal_run(session: Session, run_id: str = "run-1") -> None:
     main._init_run_state(session, run_id=run_id, conv_id="conv-1", user_text="hello")
     state = main._load_run_state(session, run_id)
@@ -38,6 +56,46 @@ def _make_terminal_run(session: Session, run_id: str = "run-1") -> None:
     state["stage"] = "completed"
     state["text"] = "final answer"
     main._save_run_state(session, state)
+
+
+def test_session_helpers_seed_expected_defaults():
+    session = Session()
+
+    run_state = main._load_run_state(session, "run-defaults")
+    panel_state = main._load_panel_state(session)
+    debug_state = main._load_debug_state(session, "run-defaults")
+
+    assert run_state["run_id"] == "run-defaults"
+    assert run_state["stage"] == "queued"
+    assert run_state["terminal"] is False
+    assert panel_state["mode"] == "history"
+    assert panel_state["paused"] is False
+    assert debug_state["paused"] is False
+    assert debug_state["resume_seq"] == 0
+    assert debug_state["cleared"] is False
+
+
+def test_run_state_save_strips_event_history_from_session():
+    session = Session()
+    run_id = "run-session-slim"
+    main._init_run_state(session, run_id=run_id, conv_id="conv-slim", user_text="hello")
+    state = main._load_run_state(session, run_id)
+    main._append_run_event(
+        state,
+        {"seq": 1, "event_type": "output.delta", "delta": "x" * 1000},
+        seq=1,
+        event_type="output.delta",
+        payload={"delta": "x" * 1000},
+        label="Text",
+        detail="x" * 1000,
+    )
+
+    main._save_run_state(session, state)
+
+    assert "events" not in session["run_state"][run_id]
+    reloaded = main._load_run_state(session, run_id)
+    assert reloaded["events"]
+    assert reloaded["events"][0]["event_type"] == "output.delta"
 
 
 def test_debug_live_mode_falls_back_for_terminal_runs(monkeypatch):
@@ -241,6 +299,32 @@ def test_terminal_run_forces_saved_live_panel_back_to_history(monkeypatch):
     assert "stream-transport-shim" not in repr(response)
 
 
+def test_get_conv_returns_four_panels(monkeypatch):
+    session = Session(
+        token="token-8",
+        user_id="user-1",
+    )
+    conv_id = "conv-8"
+
+    async def fake_list_conversations(*_args, **_kwargs):
+        return [{"id": conv_id, "turn_count": 1}]
+
+    async def fake_get_transcript(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(main.graph_api, "list_conversations", fake_list_conversations)
+    monkeypatch.setattr(main.graph_api, "get_transcript", fake_get_transcript)
+
+    async def run():
+        return await main.get_conv(conv_id, session=session, request=SimpleNamespace(headers={}))
+
+    response = asyncio.run(run())
+
+    assert len(response) == 4
+    assert "script-queue-list" in repr(response[3])
+    assert "script-queue-approve-btn" in repr(response[3])
+
+
 def test_debug_live_mode_backend_terminal_forces_history(monkeypatch):
     session = Session(
         token="token-7",
@@ -269,6 +353,120 @@ def test_debug_live_mode_backend_terminal_forces_history(monkeypatch):
     assert "stream-transport-shim" not in first_event["data"]
     assert "source: terminal" in first_event["data"]
     assert "completed" in first_event["data"]
+
+
+def test_debug_live_click_renders_stream_shim(monkeypatch):
+    session = Session(token="token-live-click")
+    run_id = "run-live-click"
+    main._init_run_state(session, run_id=run_id, conv_id="conv-live", user_text="hello")
+
+    async def run():
+        return await main.get_debug_run_events(run_id=run_id, mode="live", after_seq=0, session=session)
+
+    window, controls = asyncio.run(run())
+
+    assert session["debug_panel"]["mode"] == "live"
+    assert "stream-transport-shim" in repr(window)
+    assert "debug-stream-shim" in repr(window)
+    assert f"/debug/run-events/{run_id}/stream?after_seq=0" in repr(window)
+    assert "Mode: Live SSE" in repr(controls)
+
+
+def test_assistant_sse_relay_yields_multiple_frames_over_time(monkeypatch):
+    session = Session(token="token-assistant-stream")
+    run_id = "run-assistant-stream"
+    main._init_run_state(session, run_id=run_id, conv_id="conv-assistant", user_text="hello")
+
+    async def fake_stream_events(*_args, **_kwargs):
+        async for item in _fake_streamed_run_events(
+            [
+                {"seq": 1, "event_type": "run.stage", "stage": "prepare"},
+                {"seq": 2, "event_type": "output.delta", "delta": "Hello"},
+                {"seq": 3, "event_type": "run.completed"},
+            ],
+            delay_s=0.03,
+        ):
+            yield item
+
+    monkeypatch.setattr(main.graph_api, "stream_events", fake_stream_events)
+
+    async def run():
+        response = await main.get_events(run_id=run_id, session=session)
+        assert isinstance(response, EventSourceResponse)
+        return await _collect_timed_sse_events(response, limit=3)
+
+    items = asyncio.run(run())
+
+    assert len(items) == 3
+    assert "#1 Stage - prepare" in items[0][1]["data"]
+    assert "Hello" in items[1][1]["data"]
+    assert "#3 Completed" in items[2][1]["data"]
+    assert items[1][0] - items[0][0] >= 0.02
+    assert items[2][0] - items[1][0] >= 0.02
+
+
+def test_assistant_sse_relay_advances_state_on_first_event(monkeypatch):
+    session = Session(token="token-assistant-first-event")
+    run_id = "run-assistant-first-event"
+    main._init_run_state(session, run_id=run_id, conv_id="conv-assistant", user_text="hello")
+    main._save_panel_state(session, {"run_id": run_id, "mode": "live", "paused": False})
+
+    async def fake_stream_events(*_args, **_kwargs):
+        async for item in _fake_streamed_run_events(
+            [{"seq": 1, "event_type": "run.stage", "stage": "prepare"}],
+            delay_s=0.0,
+        ):
+            yield item
+
+    monkeypatch.setattr(main.graph_api, "stream_events", fake_stream_events)
+
+    async def run():
+        response = await main.get_events(run_id=run_id, session=session)
+        assert isinstance(response, EventSourceResponse)
+        return await _first_sse_event(response)
+
+    first = asyncio.run(run())
+
+    assert session["run_state"][run_id]["last_seq"] == 1
+    assert "#1 Stage - prepare" in first["data"]
+
+
+def test_debug_live_stream_yields_multiple_frames_over_time(monkeypatch):
+    session = Session(token="token-debug-stream")
+    run_id = "run-debug-stream"
+    main._init_run_state(session, run_id=run_id, conv_id="conv-debug", user_text="hello")
+
+    async def fake_get_run(*_args, **_kwargs):
+        return {"terminal": False, "status": "running"}
+
+    async def fake_stream_events(*_args, **_kwargs):
+        async for item in _fake_streamed_run_events(
+            [
+                {"seq": 1, "event_type": "run.stage", "stage": "prepare"},
+                {"seq": 2, "event_type": "reasoning.summary", "summary": "Preparing the answer run."},
+                {"seq": 3, "event_type": "run.completed"},
+            ],
+            delay_s=0.03,
+        ):
+            yield item
+
+    monkeypatch.setattr(main.graph_api, "get_run", fake_get_run)
+    monkeypatch.setattr(main.graph_api, "stream_events", fake_stream_events)
+
+    async def run():
+        response = await main.get_debug_run_events_stream(run_id=run_id, session=session, after_seq=0)
+        assert isinstance(response, EventSourceResponse)
+        return await _collect_timed_sse_events(response, limit=3)
+
+    items = asyncio.run(run())
+
+    assert len(items) == 3
+    assert "#1 Stage - prepare" in items[0][1]["data"]
+    assert "#2 Thought - Preparing the answer run." in items[1][1]["data"]
+    assert "#3 Completed" in items[2][1]["data"]
+    assert items[1][0] - items[0][0] >= 0.02
+    assert items[2][0] - items[1][0] >= 0.02
+    assert session["debug_panel"]["mode"] == "history"
 
 
 def test_sse_contract_runtime_guard_rejects_wrong_return_type():
@@ -314,6 +512,267 @@ def test_mypy_checks_real_sse_routes_from_main():
                 referenced_names.add(sub.id)
 
     assert selected, "expected at least one SSE route decorated with sse_route_contract"
+
+
+def test_pyodide_worker_timeout_reboots_and_marks_failure():
+    project_root = Path(__file__).resolve().parent.parent
+    script = r"""
+const fs = require('fs');
+const vm = require('vm');
+
+const source = fs.readFileSync('static/app.js', 'utf8');
+const workerInstances = [];
+const resultBox = {
+  id: 'exec-result-run-1',
+  style: { display: 'none' },
+  className: 'py-res-box',
+  innerHTML: '',
+  previousElementSibling: null,
+};
+const button = {
+  innerText: 'Run in Browser',
+  disabled: false,
+  classList: {
+    contains(name) {
+      return name === 'run-py-btn';
+    },
+  },
+  previousElementSibling: {
+    innerText: 'print("hello")',
+  },
+};
+resultBox.previousElementSibling = button;
+
+function Worker(url) {
+  this.url = url;
+  this.messages = [];
+  this.terminated = false;
+  this.postMessage = (msg) => this.messages.push(msg);
+  this.terminate = () => {
+    this.terminated = true;
+  };
+  workerInstances.push(this);
+}
+
+const sandbox = {
+  console,
+  Worker,
+  setTimeout,
+  clearTimeout,
+  requestAnimationFrame: (fn) => fn(),
+  CustomEvent: function CustomEvent(type, init) {
+    this.type = type;
+    this.detail = init?.detail;
+  },
+  document: {
+    getElementById(id) {
+      if (id === 'py-worker-timeout-ms') {
+        return { value: '500' };
+      }
+      if (id === 'exec-result-run-1') {
+        return resultBox;
+      }
+      return null;
+    },
+    addEventListener() {},
+    dispatchEvent() {},
+    querySelectorAll() { return []; },
+  },
+  window: null,
+};
+sandbox.window = sandbox;
+
+vm.runInNewContext(source, sandbox, { filename: 'static/app.js' });
+
+if (typeof sandbox.sendCodeToWorker !== 'function') {
+  throw new Error('sendCodeToWorker was not exposed');
+}
+
+const started = sandbox.sendCodeToWorker('run-1', 'while True:\n    pass', button, 'exec-result-run-1');
+if (!started) {
+  throw new Error('sendCodeToWorker refused to start the job');
+}
+
+setTimeout(() => {
+  try {
+    if (workerInstances.length < 2) {
+      throw new Error(`expected worker reboot, saw ${workerInstances.length} worker instance(s)`);
+    }
+    if (!workerInstances[0].terminated) {
+      throw new Error('expected the original worker to be terminated on timeout');
+    }
+    if (!/timed out after 500 ms/.test(resultBox.innerHTML)) {
+      throw new Error(`expected timeout error in result box, got: ${resultBox.innerHTML}`);
+    }
+    if (button.disabled) {
+      throw new Error('expected inline run button to be re-enabled after timeout');
+    }
+    if (button.innerText !== 'Run in Browser') {
+      throw new Error(`expected button label to reset, got: ${button.innerText}`);
+    }
+    process.stdout.write(JSON.stringify({
+      workers: workerInstances.length,
+      terminated: workerInstances[0].terminated,
+      result: resultBox.innerHTML,
+      buttonLabel: button.innerText,
+    }));
+  } catch (err) {
+    console.error(err && err.stack ? err.stack : String(err));
+    process.exit(1);
+  }
+}, 700);
+"""
+
+    completed = subprocess.run(
+        ["node", "-e", script],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+
+    payload = json.loads(completed.stdout.strip())
+    assert payload["workers"] >= 2
+    assert payload["terminated"] is True
+    assert "timed out after 500 ms" in payload["result"]
+    assert payload["buttonLabel"] == "Run in Browser"
+
+
+def test_pyodide_worker_error_path_does_not_block_next_run():
+    project_root = Path(__file__).resolve().parent.parent
+    script = r"""
+const fs = require('fs');
+const vm = require('vm');
+
+const source = fs.readFileSync('static/app.js', 'utf8');
+const workerInstances = [];
+const resultBoxes = {
+  'exec-result-run-1': {
+    id: 'exec-result-run-1',
+    style: { display: 'none' },
+    className: 'py-res-box',
+    innerHTML: '',
+    previousElementSibling: null,
+  },
+  'exec-result-run-2': {
+    id: 'exec-result-run-2',
+    style: { display: 'none' },
+    className: 'py-res-box',
+    innerHTML: '',
+    previousElementSibling: null,
+  },
+};
+const button = {
+  innerText: 'Run in Browser',
+  disabled: false,
+  classList: {
+    contains(name) {
+      return name === 'run-py-btn';
+    },
+  },
+  previousElementSibling: {
+    innerText: 'print("first")',
+  },
+};
+resultBoxes['exec-result-run-1'].previousElementSibling = button;
+resultBoxes['exec-result-run-2'].previousElementSibling = button;
+
+function Worker(url) {
+  this.url = url;
+  this.messages = [];
+  this.terminated = false;
+  this.postMessage = (msg) => this.messages.push(msg);
+  this.terminate = () => {
+    this.terminated = true;
+  };
+  workerInstances.push(this);
+}
+
+const sandbox = {
+  console,
+  Worker,
+  setTimeout,
+  clearTimeout,
+  requestAnimationFrame: (fn) => fn(),
+  CustomEvent: function CustomEvent(type, init) {
+    this.type = type;
+    this.detail = init?.detail;
+  },
+  document: {
+    getElementById(id) {
+      if (id === 'py-worker-timeout-ms') {
+        return { value: '500' };
+      }
+      return resultBoxes[id] || null;
+    },
+    addEventListener() {},
+    dispatchEvent() {},
+    querySelectorAll() { return []; },
+  },
+  window: null,
+};
+sandbox.window = sandbox;
+
+vm.runInNewContext(source, sandbox, { filename: 'static/app.js' });
+
+const started = sandbox.sendCodeToWorker('run-1', 'print("first")', button, 'exec-result-run-1');
+if (!started) {
+  throw new Error('first run did not start');
+}
+
+workerInstances[0].onmessage({
+  data: {
+    type: 'result',
+    id: 'run-1',
+    success: false,
+    error: 'boom',
+  },
+});
+
+if (button.disabled) {
+  throw new Error('button stayed disabled after worker error');
+}
+if (button.innerText !== 'Run in Browser') {
+  throw new Error(`button label did not reset after worker error: ${button.innerText}`);
+}
+if (!/boom/.test(resultBoxes['exec-result-run-1'].innerHTML)) {
+  throw new Error('expected error output for first run');
+}
+
+button.previousElementSibling.innerText = 'print("second")';
+const restarted = sandbox.sendCodeToWorker('run-2', 'print("second")', button, 'exec-result-run-2');
+if (!restarted) {
+  throw new Error('second run was blocked after a failure');
+}
+
+const secondWorker = workerInstances[workerInstances.length - 1];
+if (!secondWorker.messages.some((msg) => msg.type === 'execute' && msg.id === 'run-2')) {
+  throw new Error('second run was not forwarded to the restarted worker');
+}
+
+process.stdout.write(JSON.stringify({
+  workers: workerInstances.length,
+  firstWorkerTerminated: workerInstances[0].terminated,
+  firstResult: resultBoxes['exec-result-run-1'].innerHTML,
+  secondRunPosted: true,
+}));
+"""
+
+    completed = subprocess.run(
+        ["node", "-e", script],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+
+    payload = json.loads(completed.stdout.strip())
+    assert payload["workers"] >= 2
+    assert payload["firstWorkerTerminated"] is True
+    assert "boom" in payload["firstResult"]
+    assert payload["secondRunPosted"] is True
 
     helper_names = sorted(
         name

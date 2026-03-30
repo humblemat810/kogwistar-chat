@@ -1,3 +1,3 @@
 # htmxchat
 
-FastHTML + HTMX + SSE chat demo with debug tooling for assistant runs.
+FastHTML + HTMX + SSE chat demo with debug/demo tooling for assistant runs.

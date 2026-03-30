@@ -186,6 +186,7 @@ def render_stream_shim(
     sse_url: str | None = None,
     active: bool = True,
     swap_oob_target: str | None = None,
+    route_source: str = "assistant-stream-shim",
 ):
     """Render the hidden SSE transport node for one assistant run.
 
@@ -200,7 +201,7 @@ def render_stream_shim(
         "data_run_id": run_id,
         "data_stream_mode": "sse" if active else "static",
         "data_sse_url": str(sse_url or ""),
-        "data_route_source": "assistant-stream-shim",
+        "data_route_source": route_source,
         "aria_hidden": "true",
     }
     if active and sse_url:
@@ -238,7 +239,12 @@ def render_assistant_container(
             sse_url=sse_url,
             terminal=bool(error or text) and not poll_url and not sse_url and stage in {"completed", "failed", "cancelled"},
         ),
-        render_stream_shim(run_id=run_id, sse_url=sse_url, active=bool(sse_url)) if sse_url else "",
+        render_stream_shim(
+            run_id=run_id,
+            sse_url=sse_url,
+            active=bool(sse_url),
+            route_source="assistant-stream-shim",
+        ) if sse_url else "",
         cls="chat-message-container align-left",
     )
 
@@ -249,12 +255,12 @@ def render_event_log_item(
     seq: int,
     label: str,
     detail: str = "",
-    swap_oob_target: str | None = "beforeend:#events-window",
+    swap_oob_target: str | None = "beforeend:#events-list",
 ):
     """Render one event row in the right-hand event log.
 
     `hx_swap_oob` means "out-of-band swap". HTMX can insert this fragment into
-    `#events-window` even if the current request is primarily updating the chat
+    `#events-list` even if the current request is primarily updating the chat
     message area.
     """
 
@@ -393,8 +399,17 @@ def render_right_panel_viewport(
             Div(" | ".join(str(bit) for bit in status_bits), cls="text-dim debug-status-meta"),
             cls="debug-events-header",
         ),
-        render_stream_shim(run_id=run_id, sse_url=live_url, active=bool(live_url) and not paused) if mode == "live" else "",
-        Div(*(rows or [Div("No events are loaded for this run.", cls="fallback-text", style="padding: 0.75rem;")]), cls="debug-event-list"),
+        render_stream_shim(
+            run_id=run_id,
+            sse_url=live_url,
+            active=bool(live_url) and not paused,
+            route_source="debug-stream-shim",
+        ) if mode == "live" else "",
+        Div(
+            *(rows or [Div("No events are loaded for this run.", cls="fallback-text", style="padding: 0.75rem;")]),
+            id="events-list",
+            cls="debug-event-list",
+        ),
         **attrs,
     )
 
@@ -411,8 +426,6 @@ def ChatPanel(messages=None, current_conv_id=None):
 
     msg_elements = []
     for msg in messages:
-        # The backend uses `role=user|assistant`; we translate that to layout
-        # classes that control alignment and bubble styling.
         role = str(msg.get("role") or "assistant")
         sender = "user" if role == "user" else "Assistant"
         content = msg.get("content", "")
@@ -440,8 +453,6 @@ def ChatPanel(messages=None, current_conv_id=None):
                     Input(name="message", placeholder="Type your message...", id="message-input", cls="chat-input"),
                     Button("Send", cls="btn-vibrant"),
                 ),
-                # After the browser receives the server response, clear the
-                # text field so the user can type the next message immediately.
                 hx_on__after_request="this.querySelector('#message-input').value = ''",
             ),
             cls="panel-foot",
@@ -458,12 +469,7 @@ def RightPanel(
     resume_seq: int = 0,
     terminal: bool = False,
 ):
-    """Render the event stream panel on the right side.
-
-    The top form is a small debug tool. It lets us reuse the same backend run
-    event stream without sending a new chat message, which is useful when you
-    want to inspect a finished run or attach to an in-flight one.
-    """
+    """Render the event stream panel on the right side."""
 
     run_id = str(current_run_id or "").strip()
 
@@ -492,7 +498,121 @@ def RightPanel(
     )
 
 
+def ScriptQueuePanel():
+    """Render the fourth-column script queue and test editor."""
+
+    return Aside(
+        Div(
+            H2("Script Queue", cls="sidebar-title"),
+            P(
+                "Submit a test script to append a synthetic SSE event into the third panel, then queue it here.",
+                cls="text-dim",
+                style="margin-top: -0.5rem; margin-bottom: 0.75rem; font-size: 0.85rem;",
+            ),
+            Div(
+                Textarea(
+                    "",
+                    id="script-test-editor",
+                    placeholder="Write a small Python snippet...",
+                    cls="chat-input script-queue-editor",
+                    rows=5,
+                ),
+                Div(
+                    Label("Pyodide timeout (ms)", cls="script-queue-timeout-label", for_="py-worker-timeout-ms"),
+                    Input(
+                        id="py-worker-timeout-ms",
+                        type="number",
+                        value="5000",
+                        min="500",
+                        step="250",
+                        cls="chat-input script-queue-timeout-input",
+                    ),
+                    P(
+                        "If the worker does not answer in time, it is terminated and restarted automatically.",
+                        cls="text-dim script-queue-timeout-note",
+                    ),
+                    cls="script-queue-timeout-shell",
+                ),
+                Div(
+                    Button(
+                        "Submit",
+                        type="button",
+                        cls="btn-vibrant script-queue-submit",
+                        id="script-queue-submit",
+                        onclick="window.submitScriptQueueFromEditor()",
+                    ),
+                    Button(
+                        "Mock SSE Event",
+                        type="button",
+                        cls="btn-mini btn-outline script-queue-mock",
+                        id="script-queue-mock",
+                        onclick="window.emitMockSseCodeRunEvent()",
+                    ),
+                    cls="script-queue-submit-row",
+                ),
+                cls="script-queue-editor-shell",
+            ),
+            Div(
+                Div(
+                    H3("Pending Queue", cls="script-queue-subtitle"),
+                    P(
+                        "Approve the selected script to send it to Pyodide, or cancel to drop it.",
+                        cls="text-dim",
+                        style="margin-top: -0.25rem; margin-bottom: 0.5rem; font-size: 0.8rem;",
+                    ),
+                    Div(
+                        "No scripts queued yet.",
+                        id="script-queue-empty",
+                        cls="fallback-text script-queue-empty",
+                    ),
+                    Div(
+                        id="script-queue-list",
+                        cls="script-queue-list scroll-area",
+                        tabindex="0",
+                    ),
+                    cls="script-queue-body",
+                ),
+                cls="script-queue-stack",
+            ),
+            cls="panel-body",
+        ),
+        Footer(
+            Div(
+                Button(
+                    "Approve Selected",
+                    type="button",
+                    cls="btn-vibrant script-queue-action",
+                    id="script-queue-approve-btn",
+                    onclick="window.approveSelectedScript()",
+                    disabled=True,
+                ),
+                Button(
+                    "Cancel Selected",
+                    type="button",
+                    cls="btn-mini btn-outline script-queue-action",
+                    id="script-queue-cancel-btn",
+                    onclick="window.cancelSelectedScript()",
+                    disabled=True,
+                ),
+                cls="script-queue-actions",
+            ),
+            Div(
+                "Front-end only queue. Submit inserts a synthetic SSE event.",
+                cls="text-dim script-queue-note",
+            ),
+            cls="panel-foot script-queue-foot",
+        ),
+        cls="panel panel-right queue-panel shadow-premium",
+    )
+
+
 def ThreePanelLayout(*c):
     """Wrap the three panels in the page-level main container."""
+
+    return Main(*c, cls="app-shell", id="main-content")
+
+
+def FourPanelLayout(*c):
+    """Wrap the four panels in the page-level main container."""
 
     return Main(*c, cls="app-shell", id="main-content")

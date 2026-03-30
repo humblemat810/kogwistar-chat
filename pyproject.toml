@@ -25,7 +25,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["main", "graph_api", "components", "sse_contracts"]
+py-modules = ["main", "graph_api", "components", "sse_contracts", "app_contracts"]
 
 [tool.pytest.ini_options]
 markers = [
@@ -35,7 +35,7 @@ markers = [
 
 [tool.mypy]
 python_version = "3.13"
-files = ["main.py", "graph_api.py", "components.py", "tests"]
+files = ["main.py", "graph_api.py", "components.py", "app_contracts.py", "tests"]
 pretty = true
 warn_return_any = true
 warn_unused_ignores = true

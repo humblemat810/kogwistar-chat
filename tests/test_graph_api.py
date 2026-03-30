@@ -34,6 +34,20 @@ class _FakeEventSource:
         return iterator()
 
 
+class _FakeResponse:
+    def __init__(self, payload, status_code: int = 200):
+        self._payload = payload
+        self.status_code = status_code
+        self.text = "fake-response"
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"status={self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
 def test_stream_events_prefers_httpx_sse(monkeypatch):
     api = GraphAPI("http://example.com")
 
@@ -88,3 +102,39 @@ def test_stream_events_falls_back_to_custom_parser(monkeypatch):
     assert events[0]["seq"] == "9"
     assert events[0]["event_type"] == "run.completed"
     assert events[0]["status"] == "succeeded"
+
+
+def test_list_conversations_rejects_bad_payload(monkeypatch):
+    api = GraphAPI("http://example.com")
+
+    async def fake_get(*_args, **_kwargs):
+        return _FakeResponse({"conversations": "not-a-list"})
+
+    monkeypatch.setattr(api.client, "get", fake_get)
+
+    async def collect():
+        try:
+            return await api.list_conversations("token")
+        finally:
+            await api.close()
+
+    with pytest.raises(TypeError, match="response.conversations must be a JSON array"):
+        asyncio.run(collect())
+
+
+def test_get_run_events_rejects_bad_event_items(monkeypatch):
+    api = GraphAPI("http://example.com")
+
+    async def fake_get(*_args, **_kwargs):
+        return _FakeResponse({"events": ["not-a-dict"]})
+
+    monkeypatch.setattr(api.client, "get", fake_get)
+
+    async def collect():
+        try:
+            return await api.get_run_events("token", "run-1")
+        finally:
+            await api.close()
+
+    with pytest.raises(TypeError, match="response.events\\[0\\] must be a JSON object"):
+        asyncio.run(collect())
