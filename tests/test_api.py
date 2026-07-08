@@ -26,6 +26,7 @@ pytestmark = pytest.mark.manual
 
 BASE = os.getenv("LIVE_API_BASE_URL", "http://127.0.0.1:28110")
 DEFAULT_NS = os.getenv("LIVE_API_NS", "docs,conversation,workflow,wisdom")
+DEFAULT_WORKFLOW_ID = os.getenv("LIVE_API_WORKFLOW_ID", "debug.rag.v1")
 DEFAULT_STREAM_TIMEOUT_S = float(os.getenv("LIVE_SSE_TIMEOUT_S", "45"))
 DEFAULT_MIN_SPREAD_MS = int(os.getenv("LIVE_SSE_MIN_SPREAD_MS", "150"))
 
@@ -314,7 +315,7 @@ async def run_live_sse_probe(
                 f"/api/conversations/{conversation_id}/turns:answer",
                 expected_status=202,
                 headers=headers,
-                json={"text": message, "workflow_id": "agentic_answering.v2"},
+                json={"text": message, "workflow_id": DEFAULT_WORKFLOW_ID},
             )
             run_id = submit_response.json()["run_id"]
             summary["run_id"] = run_id

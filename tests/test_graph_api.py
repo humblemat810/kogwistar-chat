@@ -138,3 +138,30 @@ def test_get_run_events_rejects_bad_event_items(monkeypatch):
 
     with pytest.raises(TypeError, match="response.events\\[0\\] must be a JSON object"):
         asyncio.run(collect())
+
+
+def test_submit_turn_uses_default_chat_workflow(monkeypatch):
+    api = GraphAPI("http://example.com")
+    captured: dict[str, object] = {}
+
+    async def fake_post(path, **kwargs):
+        captured["path"] = path
+        captured["json"] = kwargs.get("json")
+        return _FakeResponse({"run_id": "run-default-workflow"}, status_code=202)
+
+    monkeypatch.setattr(api.client, "post", fake_post)
+    monkeypatch.setattr(graph_api_mod, "DEFAULT_CHAT_WORKFLOW_ID", "debug.rag.v1")
+
+    async def submit():
+        try:
+            return await api.submit_turn("token", "conv-1", "hello", user_id="user-1")
+        finally:
+            await api.close()
+
+    assert asyncio.run(submit()) == "run-default-workflow"
+    assert captured["path"] == "/api/conversations/conv-1/turns:answer"
+    assert captured["json"] == {
+        "text": "hello",
+        "user_id": "user-1",
+        "workflow_id": "debug.rag.v1",
+    }

@@ -329,7 +329,7 @@ Request body:
 {
   "user_id": "alice",
   "text": "Summarize this project",
-  "workflow_id": "agentic_answering.v2"
+  "workflow_id": "debug.rag.v1"
 }
 ```
 
@@ -343,7 +343,7 @@ Response shape:
 {
   "run_id": "run_789",
   "conversation_id": "conv_456",
-  "workflow_id": "agentic_answering.v2",
+  "workflow_id": "debug.rag.v1",
   "status": "queued",
   "user_turn_node_id": "turn|conv_456|user-2"
 }
@@ -358,7 +358,7 @@ Notes:
 Example send-message flow:
 
 ```js
-async function submitAnswer(token, conversationId, text, workflowId = "agentic_answering.v2") {
+async function submitAnswer(token, conversationId, text, workflowId = "debug.rag.v1") {
   const resp = await fetch(`/api/conversations/${conversationId}/turns:answer`, {
     method: "POST",
     headers: {
@@ -396,7 +396,7 @@ Response shape typically includes:
 {
   "run_id": "run_789",
   "conversation_id": "conv_456",
-  "workflow_id": "agentic_answering.v2",
+  "workflow_id": "debug.rag.v1",
   "status": "running",
   "terminal": false,
   "cancel_requested": false,

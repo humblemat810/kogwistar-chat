@@ -58,6 +58,7 @@ from sse_contracts import sse_route_contract, validate_sse_route_contracts
 load_dotenv()
 
 SERVER_URL = os.getenv("GRAPHRAG_SERVER_URL", "http://localhost:28110")
+CHAT_WORKFLOW_ID = os.getenv("CHAT_WORKFLOW_ID", "debug.rag.v1").strip()
 CHAT_APP_PORT = int(os.getenv("CHAT_APP_PORT", "5173"))
 CHAT_APP_URL = os.getenv("CHAT_APP_URL", f"http://localhost:{CHAT_APP_PORT}")
 POLL_INTERVAL_MS = int(os.getenv("CHAT_POLL_INTERVAL_MS", "750"))
@@ -256,6 +257,7 @@ hdrs = (
 async def lifespan(app):
     LOG.info("=== Chat App Starting ===")
     LOG.info("SERVER_URL: %s", SERVER_URL)
+    LOG.info("CHAT_WORKFLOW_ID: %s", CHAT_WORKFLOW_ID or "(server default)")
     LOG.info("CHAT_APP_PORT: %s", CHAT_APP_PORT)
     LOG.info("CHAT_STREAM_MODE: %s", CHAT_STREAM_MODE)
     # Fail fast if any SSE-only route lost its explicit SSE return contract.
@@ -1151,7 +1153,13 @@ async def post_msg(message: str, conv_id: str, session):
     _remember_conversation(session, conv_id)
 
     try:
-        run_id = await graph_api.submit_turn(token, conv_id, text, user_id=user_id)
+        run_id = await graph_api.submit_turn(
+            token,
+            conv_id,
+            text,
+            user_id=user_id,
+            workflow_id=CHAT_WORKFLOW_ID,
+        )
     except Exception as exc:
         LOG.exception("submit_turn failed conv_id=%s", conv_id)
         # Return an error message to the UI

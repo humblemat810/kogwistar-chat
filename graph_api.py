@@ -44,6 +44,7 @@ except Exception:  # pragma: no cover - optional dependency
 load_dotenv()
 
 SERVER_URL = os.getenv("GRAPHRAG_SERVER_URL", "http://localhost:28110")
+DEFAULT_CHAT_WORKFLOW_ID = os.getenv("CHAT_WORKFLOW_ID", "debug.rag.v1").strip()
 LOG = logging.getLogger("htmx.graph_api")
 
 
@@ -161,8 +162,9 @@ class GraphAPI:
         payload = {"text": text}
         if user_id:
             payload["user_id"] = user_id
-        if workflow_id:
-            payload["workflow_id"] = workflow_id
+        resolved_workflow_id = (workflow_id or DEFAULT_CHAT_WORKFLOW_ID).strip()
+        if resolved_workflow_id:
+            payload["workflow_id"] = resolved_workflow_id
 
         response = await self.client.post(
             f"/api/conversations/{conversation_id}/turns:answer",
