@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+import httpx
 
 # Keep the repo root importable when pytest executes from the tests directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -102,6 +103,32 @@ def test_stream_events_falls_back_to_custom_parser(monkeypatch):
     assert events[0]["seq"] == "9"
     assert events[0]["event_type"] == "run.completed"
     assert events[0]["status"] == "succeeded"
+
+
+def test_stream_events_does_not_fallback_on_http_error(monkeypatch):
+    api = GraphAPI("http://example.com")
+
+    async def failing_httpx(*_args, **_kwargs):
+        request = httpx.Request("GET", "http://example.com/api/runs/run-3/events")
+        response = httpx.Response(401, request=request)
+        raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+        yield  # pragma: no cover
+
+    async def should_not_run(*_args, **_kwargs):
+        raise AssertionError("HTTP errors must not trigger SSE parser fallback")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(api, "_stream_events_httpx_sse", failing_httpx)
+    monkeypatch.setattr(api, "_stream_events_custom", should_not_run)
+
+    async def collect():
+        try:
+            return [event async for event in api.stream_events("token", "run-3")]
+        finally:
+            await api.close()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(collect())
 
 
 def test_list_conversations_rejects_bad_payload(monkeypatch):

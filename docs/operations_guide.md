@@ -14,7 +14,8 @@ The backend GraphRAG service must be running separately and reachable through `G
 - `GRAPHRAG_SERVER_URL` - GraphRAG backend base URL, for example `http://localhost:28110`
 - `CHAT_APP_PORT` - frontend port, default `5001`
 - `CHAT_APP_URL` - frontend base URL used for the login redirect, default `http://localhost:5001`
-- `CHAT_WORKFLOW_ID` - backend answer workflow, default `debug.rag.v1`; set `agentic_answering.v2` to use the production workflow
+- `CHAT_WORKFLOW_ID` - backend answer workflow, default `agentic_answering.v2`; set `debug.rag.v1` explicitly for the debug path
+- `AUTH_ALLOWED_RETURN_URLS` - comma-separated exact browser return URLs accepted by core OIDC auth; include `CHAT_APP_URL/`
 - `CHAT_POLL_INTERVAL_MS` - polling interval for non-SSE mode, default `750`
 - `CHAT_STREAM_MODE` - `poll` or `sse`, default `poll`
 - `CHAT_LOG_LEVEL` - logging level, default `INFO`

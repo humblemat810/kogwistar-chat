@@ -11,10 +11,21 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, cast
 
 import httpx
 from dotenv import load_dotenv
+
+try:
+    from generated.kogwistar_api.knowledge_engine_mcp_admin_client.client import AuthenticatedClient
+    from generated.kogwistar_api.knowledge_engine_mcp_admin_client.api.chat.get_run_steps_api_runs_run_id_steps_get import asyncio_detailed as _typed_steps
+    from generated.kogwistar_api.knowledge_engine_mcp_admin_client.api.chat.get_run_checkpoints_api_runs_run_id_checkpoints_get import asyncio_detailed as _typed_checkpoints
+    from generated.kogwistar_api.knowledge_engine_mcp_admin_client.api.chat.get_run_evidence_api_runs_run_id_evidence_get import asyncio_detailed as _typed_evidence
+    from generated.kogwistar_api.knowledge_engine_mcp_admin_client.api.chat.resume_contract_api_runs_run_id_resume_contract_get import asyncio_detailed as _typed_resume_contract
+except ImportError:  # pragma: no cover - source checkout without generated artifact
+    AuthenticatedClient = None
+    _typed_steps = _typed_checkpoints = _typed_evidence = _typed_resume_contract = None
 
 from app_contracts import (
     AuthTokenResponse,
@@ -44,7 +55,19 @@ except Exception:  # pragma: no cover - optional dependency
 load_dotenv()
 
 SERVER_URL = os.getenv("GRAPHRAG_SERVER_URL", "http://localhost:28110")
-DEFAULT_CHAT_WORKFLOW_ID = os.getenv("CHAT_WORKFLOW_ID", "debug.rag.v1").strip()
+DEFAULT_CHAT_WORKFLOW_ID = os.getenv("CHAT_WORKFLOW_ID", "agentic_answering.v2").strip()
+
+
+@dataclass
+class ApiError(RuntimeError):
+    status_code: int
+    code: str
+    detail: str
+    request_id: str | None = None
+    audit_ref: str | None = None
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.detail} (HTTP {self.status_code})"
 LOG = logging.getLogger("htmx.graph_api")
 
 
@@ -85,6 +108,47 @@ class GraphAPI:
 
         return {"Authorization": f"Bearer {token}"}
 
+    def _typed_client(self, token: str):
+        if AuthenticatedClient is None:
+            return None
+        client = AuthenticatedClient(base_url=self.base_url, token=token, raise_on_unexpected_status=False)
+        return client.set_async_httpx_client(self.client)
+
+    async def _typed_get(self, operation, token: str, **kwargs: Any) -> dict[str, Any] | None:
+        client = self._typed_client(token)
+        if client is None or operation is None:
+            return None
+        response = await operation(client=client, **kwargs)
+        if int(response.status_code) >= 400:
+            self._raise_for_status(response)
+        payload = response.parsed
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _raise_for_status(response: Any) -> None:
+        if int(response.status_code) < 400:
+            return
+        payload: dict[str, Any] = {}
+        try:
+            raw = response.json() if hasattr(response, "json") else json.loads(response.content.decode("utf-8"))
+            if isinstance(raw, dict):
+                payload = raw
+        except (ValueError, TypeError):
+            pass
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        response_text = getattr(response, "text", "")
+        if not response_text and getattr(response, "content", None):
+            response_text = response.content.decode("utf-8", errors="replace")
+        detail = error.get("detail") or payload.get("detail") or response_text or "request failed"
+        code = error.get("code") or payload.get("code") or f"http_{response.status_code}"
+        raise ApiError(
+            status_code=response.status_code,
+            code=str(code),
+            detail=str(detail),
+            request_id=(error.get("request_id") or payload.get("request_id")),
+            audit_ref=(error.get("audit_ref") or payload.get("audit_ref")),
+        )
+
     async def get_dev_token(self, role: str = "ro", ns: str | list[str] = "docs") -> AuthTokenResponse:
         """Mint a developer token for testing (dev-only endpoint)."""
 
@@ -96,7 +160,7 @@ class GraphAPI:
             response = await self.client.post("/auth/dev-token", json=payload, headers=headers)
             if response.status_code != 200:
                 LOG.error("get_dev_token failed: status=%s body=%s", response.status_code, response.text)
-            response.raise_for_status()
+            self._raise_for_status(response)
             return cast(AuthTokenResponse, require_mapping(response.json(), context="get_dev_token response"))
         except Exception as exc:
             LOG.exception("Exception during get_dev_token call")
@@ -106,7 +170,7 @@ class GraphAPI:
         """Fetch the currently authenticated user profile."""
 
         response = await self.client.get("/api/auth/me", headers=self._headers(token))
-        response.raise_for_status()
+        self._raise_for_status(response)
         return cast(UserProfileResponse, require_mapping(response.json(), context="get_me response"))
 
     async def list_conversations(self, token: str, user_id: str | None = None) -> list[ConversationSummary]:
@@ -119,7 +183,7 @@ class GraphAPI:
         response = await self.client.get("/api/conversations", headers=self._headers(token))
         if response.status_code != 200:
             LOG.error("list_conversations failed: %s - %s", response.status_code, response.text)
-        response.raise_for_status()
+        self._raise_for_status(response)
         payload = cast(ConversationListResponse, require_mapping(response.json(), context="list_conversations response"))
         conversations = require_list(payload.get("conversations"), context="list_conversations response.conversations")
         return [normalize_conversation_summary(item, context=f"list_conversations response.conversations[{idx}]") for idx, item in enumerate(conversations)]
@@ -134,7 +198,7 @@ class GraphAPI:
         )
         if response.status_code != 200:
             LOG.error("create_conversation failed: %s - %s", response.status_code, response.text)
-        response.raise_for_status()
+        self._raise_for_status(response)
         payload = cast(CreateConversationResponse, require_mapping(response.json(), context="create_conversation response"))
         return require_str(payload.get("conversation_id"), context="create_conversation response.conversation_id")
 
@@ -146,7 +210,8 @@ class GraphAPI:
             payload = cast(TranscriptResponse, require_mapping(response.json(), context="get_transcript response"))
             turns = require_list(payload.get("turns"), context="get_transcript response.turns")
             return [normalize_conversation_turn(item, context=f"get_transcript response.turns[{idx}]") for idx, item in enumerate(turns)]
-        return []
+        self._raise_for_status(response)
+        return []  # unreachable; keeps type checkers precise
 
     async def submit_turn(
         self,
@@ -173,7 +238,7 @@ class GraphAPI:
         )
         if response.status_code != 202:
             LOG.error("submit_turn failed: %s - %s", response.status_code, response.text)
-        response.raise_for_status()
+        self._raise_for_status(response)
         payload = cast(SubmitTurnResponse, require_mapping(response.json(), context="submit_turn response"))
         run_id = require_str(payload.get("run_id"), context="submit_turn response.run_id")
         LOG.info("turn submitted: run_id=%s", run_id)
@@ -183,7 +248,7 @@ class GraphAPI:
         """Fetch run metadata, usually as a fallback when events are delayed."""
 
         response = await self.client.get(f"/api/runs/{run_id}", headers=self._headers(token))
-        response.raise_for_status()
+        self._raise_for_status(response)
         return cast(RunResponse, require_mapping(response.json(), context="get_run response"))
 
     async def get_run_events(self, token: str, run_id: str, after_seq: int = 0) -> list[StreamEventPayload]:
@@ -200,13 +265,87 @@ class GraphAPI:
         )
         if response.status_code != 200:
             LOG.error("get_run_events failed: %s - %s", response.status_code, response.text)
-        response.raise_for_status()
+            self._raise_for_status(response)
         payload = cast(RunEventsResponse, require_mapping(response.json(), context="get_run_events response"))
         events = require_list(payload.get("events"), context="get_run_events response.events")
         return [
             cast(StreamEventPayload, normalize_run_event(item, context=f"get_run_events response.events[{idx}]"))
             for idx, item in enumerate(events)
         ]
+
+    async def get_run_steps(self, token: str, run_id: str) -> list[dict[str, Any]]:
+        typed = await self._typed_get(_typed_steps, token, run_id=run_id)
+        if typed is not None:
+            return list(typed.get("steps") or [])
+        response = await self.client.get(f"/api/runs/{run_id}/steps", headers=self._headers(token))
+        self._raise_for_status(response)
+        payload = response.json()
+        return list(payload.get("steps") or []) if isinstance(payload, dict) else []
+
+    async def get_run_checkpoints(self, token: str, run_id: str) -> list[dict[str, Any]]:
+        typed = await self._typed_get(_typed_checkpoints, token, run_id=run_id)
+        if typed is not None:
+            return list(typed.get("checkpoints") or [])
+        response = await self.client.get(f"/api/runs/{run_id}/checkpoints", headers=self._headers(token))
+        self._raise_for_status(response)
+        payload = response.json()
+        return list(payload.get("checkpoints") or []) if isinstance(payload, dict) else []
+
+    async def get_run_snapshot(self, token: str, run_id: str, conversation_id: str) -> dict[str, Any]:
+        response = await self.client.get(
+            f"/api/conversations/{conversation_id}/snapshots/latest",
+            headers=self._headers(token),
+            params={"run_id": run_id},
+        )
+        self._raise_for_status(response)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+    async def get_run_evidence(self, token: str, run_id: str) -> dict[str, Any]:
+        typed = await self._typed_get(_typed_evidence, token, run_id=run_id)
+        if typed is not None:
+            return typed
+        response = await self.client.get(f"/api/runs/{run_id}/evidence", headers=self._headers(token))
+        self._raise_for_status(response)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+    async def get_resume_contract(self, token: str, run_id: str) -> dict[str, Any]:
+        typed = await self._typed_get(_typed_resume_contract, token, run_id=run_id)
+        if typed is not None:
+            return typed
+        response = await self.client.get(f"/api/runs/{run_id}/resume-contract", headers=self._headers(token))
+        self._raise_for_status(response)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+    async def resume_run(
+        self,
+        token: str,
+        run_id: str,
+        *,
+        suspended_node_id: str,
+        suspended_token_id: str,
+        workflow_id: str,
+        conversation_id: str,
+        turn_node_id: str,
+        client_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = await self.client.post(
+            f"/api/runs/{run_id}/resume",
+            headers=self._headers(token),
+            json={
+                "suspended_node_id": suspended_node_id,
+                "suspended_token_id": suspended_token_id,
+                "client_result": client_result or {},
+                "workflow_id": workflow_id,
+                "conversation_id": conversation_id,
+                "turn_node_id": turn_node_id,
+            },
+        )
+        self._raise_for_status(response)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
 
     async def stream_events(self, token: str, run_id: str, after_seq: int = 0) -> AsyncIterator[StreamEventPayload]:
         """Stream SSE events from the backend.
@@ -234,7 +373,9 @@ class GraphAPI:
                 yield event
             _trace_sse_graph("stream-complete", run_id=run_id, transport="httpx-sse", elapsed_ms=int((time.perf_counter() - started_at) * 1000))
             return
-        except Exception as exc:
+        except httpx.HTTPError:
+            raise
+        except RuntimeError as exc:
             _trace_sse_graph("stream-fallback", run_id=run_id, transport="httpx-sse", error=repr(exc))
             LOG.warning("httpx-sse stream failed for run_id=%s, falling back to custom parser: %s", run_id, exc)
 
@@ -307,7 +448,7 @@ class GraphAPI:
             if response.status_code != 200:
                 body = await response.aread()
                 LOG.error("stream_events failed: %s - %s", response.status_code, body.decode("utf-8", errors="replace"))
-                response.raise_for_status()
+            self._raise_for_status(response)
 
             current: dict[str, Any] = {"data_lines": []}
 
@@ -360,12 +501,17 @@ class GraphAPI:
                 if event:
                     yield cast(StreamEventPayload, event)
 
-    async def cancel_run(self, token: str, run_id: str) -> bool:
+    async def cancel_run(self, token: str, run_id: str) -> dict[str, Any]:
         """Request cancellation of a running job."""
 
         headers = self._headers(token)
         response = await self.client.post(f"/api/runs/{run_id}/cancel", headers=headers)
-        return response.status_code == 202
+        self._raise_for_status(response)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ApiError(502, "invalid_response", "cancel response must be an object")
+        status = "already-terminal" if payload.get("terminal") else "accepted"
+        return {"status": status, "run": payload}
 
     async def close(self) -> None:
         """Close the underlying HTTP connection pool."""

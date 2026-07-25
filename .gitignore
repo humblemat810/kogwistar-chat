@@ -32,3 +32,4 @@ Thumbs.db
 
 # FastHTML
 __sessions/
+tests/artifacts/

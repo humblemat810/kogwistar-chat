@@ -2,7 +2,7 @@ import httpx
 import asyncio
 import os
 
-async def test():
+async def connectivity_probe():
     raw_url = os.getenv("GRAPHRAG_SERVER_URL", "http://localhost:28110")
     print(f"DEBUG: raw_url repr: {repr(raw_url)}")
     url = raw_url.strip().strip('"').strip("'")
@@ -24,4 +24,4 @@ async def test():
             print(f"ERROR: {type(e).__name__}: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(connectivity_probe())

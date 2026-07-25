@@ -20,12 +20,13 @@ import os
 import time
 import uuid
 from urllib.parse import urlencode
-from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from dotenv import load_dotenv
 from fasthtml.common import *
 from sse_starlette.sse import EventSourceResponse
+
+import asyncio as _asyncio
 
 from app_contracts import (
     ConversationSummary,
@@ -48,6 +49,7 @@ from components import (
     render_event_log_item,
     render_right_panel_controls,
     render_right_panel_viewport,
+    RunInspector,
     render_stream_shim,
     render_thinking_state,
     render_user_message,
@@ -58,27 +60,30 @@ from sse_contracts import sse_route_contract, validate_sse_route_contracts
 load_dotenv()
 
 SERVER_URL = os.getenv("GRAPHRAG_SERVER_URL", "http://localhost:28110")
-CHAT_WORKFLOW_ID = os.getenv("CHAT_WORKFLOW_ID", "debug.rag.v1").strip()
+CHAT_WORKFLOW_ID = os.getenv("CHAT_WORKFLOW_ID", "agentic_answering.v2").strip()
 CHAT_APP_PORT = int(os.getenv("CHAT_APP_PORT", "5173"))
 CHAT_APP_URL = os.getenv("CHAT_APP_URL", f"http://localhost:{CHAT_APP_PORT}")
 POLL_INTERVAL_MS = int(os.getenv("CHAT_POLL_INTERVAL_MS", "750"))
 CHAT_STREAM_MODE = str(os.getenv("CHAT_STREAM_MODE", "poll")).strip().lower()
 if CHAT_STREAM_MODE not in {"poll", "sse"}:
     CHAT_STREAM_MODE = "poll"
+CHAT_RELOAD = str(os.getenv("CHAT_RELOAD", "true")).strip().lower() not in {"0", "false", "no", "off"}
 LOG_LEVEL = str(os.getenv("CHAT_LOG_LEVEL", "INFO")).upper()
+CHAT_LOG_PATH = os.getenv("CHAT_LOG_PATH", "chat_app.log")
+PAYLOAD_LOG_PATH = os.getenv("CHAT_PAYLOAD_LOG_PATH", "payload.log")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s [%(name)s] [%(filename)s:%(lineno)d] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("chat_app.log", encoding="utf-8")
+        logging.FileHandler(CHAT_LOG_PATH, encoding="utf-8")
     ]
 )
 LOG = logging.getLogger("htmx.main")
 PAYLOAD_LOG = logging.getLogger("htmx.payload")
 if not PAYLOAD_LOG.handlers:
-    _payload_handler = logging.FileHandler("payload.log", encoding="utf-8")
+    _payload_handler = logging.FileHandler(PAYLOAD_LOG_PATH, encoding="utf-8")
     _payload_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
     PAYLOAD_LOG.addHandler(_payload_handler)
 PAYLOAD_LOG.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
@@ -253,7 +258,6 @@ hdrs = (
     Script(src="/static/app.js", defer=True),
 )
 
-@asynccontextmanager
 async def lifespan(app):
     LOG.info("=== Chat App Starting ===")
     LOG.info("SERVER_URL: %s", SERVER_URL)
@@ -841,9 +845,15 @@ async def post_cancel(run_id: str, session):
     token = _get_session_token(session)
     if not token:
         return ""
-    success = await graph_api.cancel_run(token, run_id)
-    LOG.info("cancel_run run_id=%s success=%s", run_id, success)
-    return ""
+    try:
+        outcome = await graph_api.cancel_run(token, run_id)
+        LOG.info("cancel_run run_id=%s outcome=%s", run_id, outcome.get("status"))
+        if outcome.get("status") == "already-terminal":
+            return Div("Run already finished.", cls="transport-notice")
+        return Div("Cancellation requested.", cls="transport-notice")
+    except Exception as exc:
+        LOG.exception("cancel_run failed run_id=%s", run_id)
+        return Div(f"Cancellation failed: {exc}", cls="error-msg")
 
 
 def _handle_debug_clear(run_id: str, session):
@@ -982,7 +992,7 @@ async def post_login_dev(session):
 def get_login():
     """Render the standalone login page."""
 
-    login_url = f"{SERVER_URL}/api/auth/login?" + urlencode({"redirect_uri": f"{CHAT_APP_URL}/"})
+    login_url = f"{SERVER_URL}/api/auth/login?" + urlencode({"return_to": f"{CHAT_APP_URL}/"})
     return Title("Login"), Main(
         Section(cls="panel shadow-premium", style="margin: auto; margin-top: 10vh; max-width: 480px; padding: 2.5rem;")(
             Header(H1("GraphRAG Chat", cls="vibrant-text", style="font-size: 2rem; text-align: center;")),
@@ -1198,6 +1208,56 @@ async def post_msg(message: str, conv_id: str, session):
     return (render_user_message(username=username, message=text), assistant, *panel_updates)
 
 
+@rt("/runs/{run_id}/inspector")
+async def get_run_inspector(run_id: str, session):
+    """Render read-only lifecycle and evidence details for one backend run."""
+
+    token = _get_session_token(session)
+    if not token:
+        return RunInspector(run={}, steps=[], checkpoints=[], evidence={}, error="Please log in again.")
+
+    try:
+        run = await graph_api.get_run(token, run_id)
+        steps, checkpoints, evidence, resume_contract = await _asyncio.gather(
+            graph_api.get_run_steps(token, run_id),
+            graph_api.get_run_checkpoints(token, run_id),
+            graph_api.get_run_evidence(token, run_id),
+            graph_api.get_resume_contract(token, run_id),
+        )
+        return RunInspector(
+            run=run,
+            steps=steps,
+            checkpoints=checkpoints,
+            evidence=evidence,
+            resume_contract=resume_contract,
+        )
+    except Exception as exc:
+        LOG.exception("run inspector failed run_id=%s", run_id)
+        return RunInspector(run={}, steps=[], checkpoints=[], evidence={}, error=f"Run inspection failed: {exc}")
+
+
+@rt("/runs/{run_id}/resume")
+async def post_run_resume(run_id: str, suspended_node_id: str, suspended_token_id: str, session):
+    token = _get_session_token(session)
+    if not token:
+        return Div("Please log in again.", cls="error-msg")
+    try:
+        run = await graph_api.get_run(token, run_id)
+        result = await graph_api.resume_run(
+            token,
+            run_id,
+            suspended_node_id=suspended_node_id,
+            suspended_token_id=suspended_token_id,
+            workflow_id=str(run.get("workflow_id") or ""),
+            conversation_id=str(run.get("conversation_id") or ""),
+            turn_node_id=str(run.get("turn_node_id") or ""),
+        )
+        return Div(f"Resume submitted: {result.get('workflow_status') or 'accepted'}", cls="transport-notice")
+    except Exception as exc:
+        LOG.exception("resume failed run_id=%s", run_id)
+        return Div(f"Resume failed: {exc}", cls="error-msg")
+
+
 @rt("/runs/{run_id}/poll")
 async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
     """Poll the backend for new run events.
@@ -1253,8 +1313,9 @@ async def get_run_poll(run_id: str, after_seq: int = 0, session=None):
     push_debug_rows = _should_push_event_to_debug_panel(session, run_id)
     for evt in events:
         seq, event_type, payload, label, detail = _ingest_run_event(state, evt)
-        if push_debug_rows:
-            oob_logs.append(render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail))
+        # Stream fragments must not target a mutable child node.  The complete
+        # event window is replaced once terminal, avoiding OOB race/ordering
+        # failures when HTMX processes the first SSE response.
         LOG.info("poll event run_id=%s seq=%s event=%s detail=%s push_debug=%s", run_id, seq, label, detail, push_debug_rows)
 
     if not bool(state.get("terminal")):
@@ -1359,7 +1420,7 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                 push_debug_rows = _should_push_event_to_debug_panel(session, run_id)
                 LOG.info("sse event run_id=%s seq=%s event=%s detail=%s push_debug=%s", run_id, seq, label, detail, push_debug_rows)
                 _save_run_state(session, state)
-                oob_log = render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail) if push_debug_rows else ""
+                oob_log = ""
 
                 body = render_assistant_body(
                     run_id=run_id,
@@ -1378,7 +1439,8 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                         active=False,
                         swap_oob_target=f"outerHTML:#run-stream-{run_id}",
                     )
-                    message_html = f"{_render_sse_fragment(body)}{_render_sse_fragment(oob_log)}{_render_sse_fragment(shim)}"
+                    events_window = _render_events_window_oob(session, run_id, live=False, source="terminal")
+                    message_html = f"{_render_sse_fragment(body)}{_render_sse_fragment(events_window)}{_render_sse_fragment(oob_log)}{_render_sse_fragment(shim)}"
                     _trace_sse_server(
                         "relay-emitting",
                         run_id=run_id,
@@ -1661,7 +1723,10 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) 
                 debug_state["resume_seq"] = int(state.get("last_seq") or seq)
                 _save_debug_state(session, run_id, debug_state)
 
-                oob_log = render_event_log_item(run_id=run_id, seq=seq, label=label, detail=detail)
+                # Do not append into optional #events-list from a long-lived
+                # debug stream; inspector can replace that node mid-stream.
+                # Terminal branch replaces the complete event window.
+                oob_log = ""
                 banner = Div(f"Watching run {run_id} · {label} #{seq}", cls="debug-status-line")
 
                 # The banner keeps the SSE target alive while the rows append into
@@ -1754,4 +1819,4 @@ _RELOAD_EXCLUDES = [
 
 # Keep hot-reload useful for code and UI edits, but ignore the common noisy
 # files that editors, test runs, and the app itself generate.
-serve(port=CHAT_APP_PORT, reload_excludes=_RELOAD_EXCLUDES)
+serve(port=CHAT_APP_PORT, reload=CHAT_RELOAD, reload_excludes=_RELOAD_EXCLUDES)

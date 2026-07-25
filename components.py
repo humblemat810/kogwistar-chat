@@ -15,6 +15,7 @@ the server renders HTML fragments, and HTMX swaps those fragments into the page.
 """
 
 import html
+import json
 
 from fasthtml.common import *
 
@@ -257,7 +258,7 @@ def render_event_log_item(
     seq: int,
     label: str,
     detail: str = "",
-    swap_oob_target: str | None = "beforeend:#events-list",
+    swap_oob_target: str | None = None,
 ):
     """Render one event row in the right-hand event log.
 
@@ -374,6 +375,15 @@ def render_right_panel_controls(
             f"Mode: {'Live SSE' if is_live else 'History'}{' (completed)' if terminal else ''}{' (paused)' if paused else ''}",
             cls="text-dim debug-mode-note",
         ),
+        Button(
+            "Inspect run",
+            type="button",
+            hx_get=f"/runs/{current_run_id}/inspector" if current_run_id else "",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            cls="btn-mini btn-outline",
+            disabled=not bool(current_run_id),
+        ),
         **attrs,
     )
 
@@ -463,6 +473,36 @@ def ChatPanel(messages=None, current_conv_id=None):
     )
 
 
+def RunInspector(*, run: dict, steps: list, checkpoints: list, evidence: dict, resume_contract: dict | None = None, error: str | None = None):
+    """Render bounded run lifecycle and evidence inspection."""
+
+    if error:
+        return Div(Div(error, cls="error-msg"), cls="run-inspector")
+    contract = resume_contract or {}
+    options = list(contract.get("resume_options") or [])
+    resume_ui = [
+        Form(
+            Input(type="hidden", name="suspended_node_id", value=option.get("suspended_node_id", "")),
+            Input(type="hidden", name="suspended_token_id", value=option.get("suspended_token_id", "")),
+            Button("Resume (confirm)", type="submit", cls="btn-mini btn-outline"),
+            hx_post=f"/runs/{run.get('run_id') or run.get('id')}/resume",
+            hx_target="#events-window",
+            hx_swap="innerHTML",
+            hx_confirm="Resume this suspended run?",
+        )
+        for option in options
+    ]
+    return Div(
+        H3(f"Run {run.get('run_id') or run.get('id') or ''}", cls="sidebar-title"),
+        P(f"Status: {run.get('status') or ('terminal' if run.get('terminal') else 'running')}", cls="text-dim"),
+        Details(Summary(f"Steps ({len(steps)})"), Pre(json.dumps(steps, ensure_ascii=False, indent=2, default=str))),
+        Details(Summary(f"Checkpoints ({len(checkpoints)})"), Pre(json.dumps(checkpoints, ensure_ascii=False, indent=2, default=str))),
+        Details(Summary("Evidence"), Pre(json.dumps(evidence, ensure_ascii=False, indent=2, default=str))),
+        Details(Summary(f"Resume ({len(options)} option(s))"), *(resume_ui or [P("No resumable suspended token is exposed.", cls="text-dim")])),
+        cls="run-inspector scroll-area",
+    )
+
+
 def RightPanel(
     current_run_id: str | None = None,
     *,
@@ -490,6 +530,9 @@ def RightPanel(
                     cls="fallback-text",
                     style="padding: 0.75rem;",
                 ),
+                # Keep OOB event-log target present before first SSE/poll event.
+                # Backend event fragments may arrive before viewport replacement.
+                Div(id="events-list", cls="debug-event-list"),
                 id="events-window",
                 cls="events-window scroll-area",
                 tabindex="0",
