@@ -460,6 +460,32 @@ def test_assistant_sse_relay_advances_state_on_first_event(monkeypatch):
     assert f"evt-{run_id}-1" in first["data"]
 
 
+def test_upstream_failure_event_surfaces_nested_error_message():
+    session = Session(token="token-failure-event")
+    main._init_run_state(
+        session,
+        run_id="run-failure-event",
+        conv_id="conv-failure",
+        user_text="hello",
+    )
+    state = main._load_run_state(session, "run-failure-event")
+
+    _seq, event_type, _payload, label, detail = main._ingest_run_event(
+        state,
+        {
+            "seq": 1,
+            "event_type": "run.failed",
+            "error": {"message": "workflow worker stopped"},
+        },
+    )
+
+    assert event_type == "run.failed"
+    assert label == "Failed"
+    assert detail == "workflow worker stopped"
+    assert state["terminal"] is True
+    assert state["error"] == "workflow worker stopped"
+
+
 def test_debug_live_stream_yields_multiple_frames_over_time(monkeypatch):
     session = Session(token="token-debug-stream")
     run_id = "run-debug-stream"

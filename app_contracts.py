@@ -122,6 +122,7 @@ class StreamEventPayload(TypedDict, total=False):
     workflow_node_id: str
     assistant_text: str
     assistant_turn_node_id: str
+    error: Any
 
 
 def require_mapping(value: Any, *, context: str) -> dict[str, Any]:
@@ -160,8 +161,9 @@ def normalize_conversation_summary(value: Any, *, context: str) -> ConversationS
     """Validate and normalize a conversation summary record."""
 
     payload = require_mapping(value, context=context)
+    conversation_id = payload.get("id") or payload.get("conversation_id")
     return {
-        "id": require_str(payload.get("id"), context=f"{context}.id"),
+        "id": require_str(conversation_id, context=f"{context}.id"),
         "turn_count": int(payload.get("turn_count") or 0),
     }
 

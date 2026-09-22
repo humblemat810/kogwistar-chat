@@ -149,6 +149,23 @@ def test_list_conversations_rejects_bad_payload(monkeypatch):
         asyncio.run(collect())
 
 
+def test_list_conversations_accepts_upstream_conversation_id_alias(monkeypatch):
+    api = GraphAPI("http://example.com")
+
+    async def fake_get(*_args, **_kwargs):
+        return _FakeResponse({"conversations": [{"conversation_id": "conv-1", "turn_count": 2}]})
+
+    monkeypatch.setattr(api.client, "get", fake_get)
+
+    async def collect():
+        try:
+            return await api.list_conversations("token")
+        finally:
+            await api.close()
+
+    assert asyncio.run(collect()) == [{"id": "conv-1", "turn_count": 2}]
+
+
 def test_get_run_events_rejects_bad_event_items(monkeypatch):
     api = GraphAPI("http://example.com")
 

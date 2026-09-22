@@ -629,9 +629,15 @@ def _event_label(event_type: str, payload: dict) -> tuple[str, str]:
     if event_type == "run.completed":
         return "Completed", ""
     if event_type == "run.failed":
-        return "Failed", str(payload.get("message") or "")
+        error = payload.get("error")
+        if isinstance(error, dict):
+            error = error.get("message") or error.get("detail") or error.get("code")
+        return "Failed", str(error or payload.get("message") or "")
     if event_type == "run.cancelled":
-        return "Cancelled", str(payload.get("message") or "")
+        error = payload.get("error")
+        if isinstance(error, dict):
+            error = error.get("message") or error.get("detail") or error.get("code")
+        return "Cancelled", str(error or payload.get("message") or "")
     return event_type.replace("run.", "").capitalize(), ""
 
 
@@ -651,6 +657,12 @@ def _event_payload(evt: StreamEventPayload) -> dict:
         for key, value in evt.items()
         if key not in {"seq", "event_type", "type", "payload"}
     }
+
+
+def _sse_event_marker(run_id: str, seq: int) -> str:
+    """Keep a stable, inert marker for browser/debug trace correlation."""
+
+    return f"<!-- evt-{run_id}-{seq} -->"
 
 
 def _ingest_run_event(state: RunState, evt: StreamEventPayload) -> tuple[int, str, dict, str, str]:
@@ -702,7 +714,14 @@ def _ingest_run_event(state: RunState, evt: StreamEventPayload) -> tuple[int, st
     elif event_type in {"run.failed", "run.cancelled"}:
         state["terminal"] = True
         state["stage"] = event_type.replace("run.", "")
-        err = payload.get("message") or evt.get("message") or state.get("error")
+        err = payload.get("message") or evt.get("message")
+        if not err:
+            error = payload.get("error") or evt.get("error")
+            if isinstance(error, dict):
+                err = error.get("message") or error.get("detail") or error.get("code")
+            elif error:
+                err = error
+        err = err or state.get("error")
         if err:
             state["error"] = str(err)
 
@@ -1440,7 +1459,7 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                         swap_oob_target=f"outerHTML:#run-stream-{run_id}",
                     )
                     events_window = _render_events_window_oob(session, run_id, live=False, source="terminal")
-                    message_html = f"{_render_sse_fragment(body)}{_render_sse_fragment(events_window)}{_render_sse_fragment(oob_log)}{_render_sse_fragment(shim)}"
+                    message_html = f"{_sse_event_marker(run_id, seq)}{_render_sse_fragment(body)}{_render_sse_fragment(events_window)}{_render_sse_fragment(oob_log)}{_render_sse_fragment(shim)}"
                     _trace_sse_server(
                         "relay-emitting",
                         run_id=run_id,
@@ -1460,7 +1479,7 @@ async def get_events(run_id: str, session) -> EventSourceResponse:
                     yield dict(data=message_html, event="message")
                     break
 
-                message_html = f"{_render_sse_fragment(body)}{_render_sse_fragment(oob_log)}"
+                message_html = f"{_sse_event_marker(run_id, seq)}{_render_sse_fragment(body)}{_render_sse_fragment(oob_log)}"
                 _trace_sse_server(
                     "relay-emitting",
                     run_id=run_id,
@@ -1751,7 +1770,7 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) 
                         payload=f"{_render_sse_fragment(oob_log)}{_render_sse_fragment(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{_render_sse_fragment(_render_controls_oob(session, run_id))}",
                     )
                     yield dict(
-                        data=f"{_render_sse_fragment(oob_log)}{_render_sse_fragment(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{_render_sse_fragment(_render_controls_oob(session, run_id))}",
+                        data=f"{_sse_event_marker(run_id, seq)}{_render_sse_fragment(oob_log)}{_render_sse_fragment(_render_events_window_oob(session, run_id, live=False, source='terminal'))}{_render_sse_fragment(_render_controls_oob(session, run_id))}",
                         event="message",
                     )
                     break
@@ -1771,7 +1790,7 @@ async def get_debug_run_events_stream(run_id: str, session, after_seq: int = 0) 
                     event_type=event_type,
                     payload=_render_sse_fragment(oob_log),
                 )
-                yield dict(data=_render_sse_fragment(oob_log), event="message")
+                yield dict(data=f"{_sse_event_marker(run_id, seq)}{_render_sse_fragment(oob_log)}", event="message")
         except Exception as exc:
             LOG.exception("debug stream error run_id=%s", run_id)
             _trace_sse_server("debug-live-error", run_id=run_id, error=repr(exc), elapsed_ms=int((time.perf_counter() - stream_started_at) * 1000))
